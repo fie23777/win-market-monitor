@@ -1,0 +1,7 @@
+﻿MetaTrader5>=5.0.45
+psycopg2-binary>=2.9.9
+pyarrow>=14.0.0
+zstandard>=0.22.0
+pyyaml>=6.0.1
+pytz>=2024.1
+pytest>=8.0.0

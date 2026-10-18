@@ -1,0 +1,23 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+env/
+venv/
+.venv/
+.pytest_cache/
+
+# Databases & local buffers
+data/buffer/*.db
+data/buffer/*.db-wal
+data/buffer/*.db-shm
+
+# Archives & logs
+data/archive/
+data/backup/
+*.log
+
+# Docker
+.env

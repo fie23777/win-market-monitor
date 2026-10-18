@@ -1,0 +1,32 @@
+﻿symbol: "WINZ26"
+timezones:
+  storage: "UTC"
+  display: "America/Sao_Paulo"
+
+buffer:
+  sqlite_path: "data/buffer/spool.db"
+  journal_mode: "WAL"
+  synchronous: "FULL"
+  batch_size: 1000
+
+postgres:
+  host: "localhost"
+  port: 5432
+  database: "market_data"
+  user: "postgres"
+  password: "password"
+  retention_trading_days: 30
+
+parquet:
+  archive_dir: "data/archive"
+  backup_dir: "data/backup"
+  compression: "zstd"
+  compression_level: 7
+  ticks_retention_years: 1
+  candles_m2_retention_years: 3
+
+collector:
+  read_only: true
+  allow_orders: false
+  poll_interval_ms: 100
+  gap_inactivity_threshold_seconds: 15
