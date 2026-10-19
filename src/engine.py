@@ -216,6 +216,20 @@ class MarketCollectorEngine:
                 synced += 1
         return synced
 
+    def maybe_sync_m2_candles(self, last_sync_timestamp: float, interval_sec: float = 60.0) -> tuple[float, int]:
+        """
+        Sincroniza candles M2 se tiver decorrido o intervalo estipulado.
+        """
+        now = time.time()
+        if now - last_sync_timestamp >= interval_sec:
+            try:
+                count = self.sync_m2_candles()
+                return now, count
+            except Exception as e:
+                logger.warning(f"Aviso ao sincronizar candles M2: {e}")
+                return now, 0
+        return last_sync_timestamp, 0
+
     def shutdown(self) -> None:
         """
         Encerramento seguro do engine e liberação explícita da conexão com o MT5.
