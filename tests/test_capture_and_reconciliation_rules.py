@@ -25,16 +25,23 @@ def test_session_start_calculation_anchors_at_0900_brt():
 
     target_date = date(2026, 10, 19)
     session_msc = engine._get_session_start_msc(target_date=target_date)
-    session_dt = datetime.fromtimestamp(session_msc / 1000.0, tz=timezone.utc)
-
-    # 19/10/2026 09:00 BRT corresponde a 19/10/2026 12:00:00 UTC
-    assert session_dt.year == 2026
-    assert session_dt.month == 10
-    assert session_dt.day == 19
-    assert session_dt.hour == 12
-    assert session_dt.minute == 0
-    assert session_dt.second == 0
-    assert session_msc > 0
+    
+    # 1. No referencial numérico do servidor MT5 XP: 1792400400000 msc (09:00:00 civil)
+    assert session_msc == 1792400400000
+    
+    # 2. Normalizado para UTC real do evento na B3: 12:00:00 UTC
+    utc_dt = engine.time_normalizer.server_msc_to_utc_datetime(session_msc)
+    assert utc_dt.year == 2026
+    assert utc_dt.month == 10
+    assert utc_dt.day == 19
+    assert utc_dt.hour == 12
+    assert utc_dt.minute == 0
+    assert utc_dt.second == 0
+    
+    # 3. No fuso civil de mercado B3 (America/Sao_Paulo): 09:00:00 BRT
+    market_dt = engine.time_normalizer.server_msc_to_market_datetime(session_msc)
+    assert market_dt.hour == 9
+    assert market_dt.minute == 0
 
 def test_book_only_ticks_are_completely_excluded():
     """

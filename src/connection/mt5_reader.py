@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
@@ -6,6 +6,8 @@ try:
     import MetaTrader5 as mt5
 except ImportError:
     mt5 = None
+
+from src.connection.mt5_time_normalizer import MT5TimeNormalizer
 
 logger = logging.getLogger(__name__)
 
@@ -15,8 +17,9 @@ class MT5ReadOnlyReader:
     PROIBIDO: Qualquer implementação ou importação de envio ou modificação de ordens.
     """
 
-    def __init__(self):
+    def __init__(self, time_normalizer: Optional[MT5TimeNormalizer] = None):
         self.connected = False
+        self.time_normalizer = time_normalizer or MT5TimeNormalizer()
 
     def initialize(self, path: Optional[str] = None) -> bool:
         """Inicializa a conexão com o terminal MetaTrader 5."""
@@ -58,19 +61,43 @@ class MT5ReadOnlyReader:
             return False
         return bool(mt5.symbol_select(symbol, True))
 
+    def _resolve_query_datetime(self, dt_or_msc: Any) -> datetime:
+        """
+        Converte datetime UTC/Mercado ou timestamp inteiro para o datetime
+        esperado pelas chamadas copy_ticks_* / copy_rates_* da C-extension do MT5.
+        """
+        if isinstance(dt_or_msc, (int, float)):
+            # Se for milissegundos (> 10^11), converter para segundos inteiros
+            sec = int(dt_or_msc // 1000) if dt_or_msc > 1e11 else int(dt_or_msc)
+            return datetime.fromtimestamp(sec, tz=timezone.utc)
+        elif isinstance(dt_or_msc, datetime):
+            if dt_or_msc.tzinfo is not None:
+                # Normalizar datetime ciente de timezone para o Server Time do MT5
+                return self.time_normalizer.utc_datetime_to_server_datetime(dt_or_msc)
+            else:
+                # Naive: tratar como horário já no referencial do servidor
+                return dt_or_msc.replace(tzinfo=timezone.utc)
+        else:
+            raise ValueError(f"Tipo temporal inválido para consulta MT5: {type(dt_or_msc)}")
+
     def fetch_ticks_range(
         self,
         symbol: str,
-        from_utc: datetime,
-        to_utc: datetime
+        from_time: Any,
+        to_time: Any
     ) -> List[Dict[str, Any]]:
         """
-        Consulta histórico de ticks no MT5 em um intervalo UTC especificado.
+        Consulta histórico de ticks no MT5 no intervalo especificado.
+        Aceita datetime (UTC ou mercado) ou timestamps numéricos.
+        Preserva rigorosamente os inteiros time e time_msc originais.
         """
         if not mt5:
             return []
 
-        ticks_arr = mt5.copy_ticks_range(symbol, from_utc, to_utc, mt5.COPY_TICKS_ALL)
+        dt_from = self._resolve_query_datetime(from_time)
+        dt_to = self._resolve_query_datetime(to_time)
+
+        ticks_arr = mt5.copy_ticks_range(symbol, dt_from, dt_to, mt5.COPY_TICKS_ALL)
         if ticks_arr is None or len(ticks_arr) == 0:
             return []
 
@@ -91,16 +118,20 @@ class MT5ReadOnlyReader:
     def fetch_ticks_from(
         self,
         symbol: str,
-        from_utc: datetime,
+        from_time: Any,
         count: int = 1000
     ) -> List[Dict[str, Any]]:
         """
-        Consulta os próximos ticks a partir de um instante UTC com limite de contagem.
+        Consulta os próximos ticks a partir de um instante inicial com limite de contagem.
+        Aceita datetime (UTC ou mercado) ou timestamp numérico msc.
+        Preserva rigorosamente os inteiros time e time_msc originais.
         """
         if not mt5:
             return []
 
-        ticks_arr = mt5.copy_ticks_from(symbol, from_utc, count, mt5.COPY_TICKS_ALL)
+        dt_from = self._resolve_query_datetime(from_time)
+
+        ticks_arr = mt5.copy_ticks_from(symbol, dt_from, count, mt5.COPY_TICKS_ALL)
         if ticks_arr is None or len(ticks_arr) == 0:
             return []
 
@@ -122,16 +153,19 @@ class MT5ReadOnlyReader:
         self,
         symbol: str,
         timeframe: int,
-        from_utc: datetime,
-        to_utc: datetime
+        from_time: Any,
+        to_time: Any
     ) -> List[Dict[str, Any]]:
         """
-        Consulta candles históricos do MT5 no intervalo UTC.
+        Consulta candles históricos do MT5 no intervalo especificado.
         """
         if not mt5:
             return []
 
-        rates_arr = mt5.copy_rates_range(symbol, timeframe, from_utc, to_utc)
+        dt_from = self._resolve_query_datetime(from_time)
+        dt_to = self._resolve_query_datetime(to_time)
+
+        rates_arr = mt5.copy_rates_range(symbol, timeframe, dt_from, dt_to)
         if rates_arr is None or len(rates_arr) == 0:
             return []
 

@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from collections import defaultdict
 from typing import List, Dict, Tuple, Any, Optional
 from src.domain.models import TradeTick, compute_tick_event_signature, compute_tick_fingerprint
+from src.connection.mt5_time_normalizer import MT5TimeNormalizer
 
 # Constantes de flags oficiais do MetaTrader 5
 TICK_FLAG_BID = 2
@@ -20,8 +21,13 @@ class TickReconciler:
     Filtra estritamente atualizações exclusivas de book (BID/ASK) persistindo apenas negócios válidos.
     """
 
-    def __init__(self, memory_retention_ms: int = 120_000):
+    def __init__(
+        self,
+        memory_retention_ms: int = 120_000,
+        time_normalizer: Optional[MT5TimeNormalizer] = None
+    ):
         self.memory_retention_ms = memory_retention_ms
+        self.time_normalizer = time_normalizer or MT5TimeNormalizer()
         # Mapeia (time_msc, event_signature) -> quantidade de ocorrências já emitidas
         self._emitted_multiplicity: Dict[Tuple[int, str], int] = defaultdict(int)
         self._last_seen_msc: int = 0
@@ -100,7 +106,7 @@ class TickReconciler:
                 for idx in range(m_emitted, k_batch):
                     inst = instances[idx]
                     ordinal = idx + 1
-                    t_utc = datetime.fromtimestamp(time_msc / 1000.0, tz=timezone.utc)
+                    t_utc = self.time_normalizer.server_msc_to_utc_datetime(time_msc)
                     fp = compute_tick_fingerprint(time_msc, sig, ordinal)
 
                     tt = TradeTick(

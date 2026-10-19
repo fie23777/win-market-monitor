@@ -2,6 +2,8 @@ symbol: "WINZ26"
 timezones:
   storage: "UTC"
   display: "America/Sao_Paulo"
+  market: "America/Sao_Paulo"
+  mt5_server: "America/Sao_Paulo"
 
 buffer:
   sqlite_path: "data/buffer/spool.db"

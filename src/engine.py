@@ -11,6 +11,7 @@ except Exception:
 
 from src.config import AppConfig
 from src.domain.models import Checkpoints
+from src.connection.mt5_time_normalizer import MT5TimeNormalizer
 from src.connection.mt5_reader import MT5ReadOnlyReader
 from src.buffer.durable_spool import DurableSpool
 from src.reconciliation.tick_reconciler import TickReconciler
@@ -32,11 +33,17 @@ class MarketCollectorEngine:
         config: AppConfig,
         reader: Optional[MT5ReadOnlyReader] = None,
         spool: Optional[DurableSpool] = None,
-        writer: Optional[PostgresMarketWriter] = None
+        writer: Optional[PostgresMarketWriter] = None,
+        time_normalizer: Optional[MT5TimeNormalizer] = None
     ):
         self.config = config
         self.symbol = config.symbol
-        self.reader = reader or MT5ReadOnlyReader()
+        
+        server_tz = config.timezones.get("mt5_server", "America/Sao_Paulo") if hasattr(config, "timezones") and isinstance(config.timezones, dict) else "America/Sao_Paulo"
+        market_tz = config.timezones.get("market", "America/Sao_Paulo") if hasattr(config, "timezones") and isinstance(config.timezones, dict) else "America/Sao_Paulo"
+        self.time_normalizer = time_normalizer or MT5TimeNormalizer(server_timezone=server_tz, market_timezone=market_tz)
+
+        self.reader = reader or MT5ReadOnlyReader(time_normalizer=self.time_normalizer)
         self.spool = spool or DurableSpool(config.buffer.sqlite_path)
         self.writer = writer or PostgresMarketWriter(
             host=config.postgres.host,
@@ -45,7 +52,7 @@ class MarketCollectorEngine:
             user=config.postgres.user,
             password=config.postgres.password
         )
-        self.reconciler = TickReconciler()
+        self.reconciler = TickReconciler(time_normalizer=self.time_normalizer)
         self.gap_manager = GapRecoveryManager(
             reader=self.reader,
             reconciler=self.reconciler,
@@ -56,15 +63,12 @@ class MarketCollectorEngine:
 
     def _get_session_start_msc(self, target_date: Optional[date] = None) -> int:
         """
-        Retorna o instante em milissegundos UTC do início da sessão de negociação (09:00 BRT).
-        Para 19/10/2026 às 09:00 BRT -> 12:00 UTC (1792411200000 msc).
+        Retorna o instante em milissegundos no referencial do servidor MT5
+        para o início da sessão de negociação B3 (09:00 BRT).
+        Para 19/10/2026 às 09:00 BRT -> 1792400400000 msc (servidor XP).
         Garante que a captura nunca inicie na época de 1970 na ausência de checkpoint.
         """
-        now_utc = datetime.now(timezone.utc)
-        if target_date is None:
-            target_date = now_utc.astimezone(BRT_TZ).date()
-        session_brt = datetime(target_date.year, target_date.month, target_date.day, 9, 0, 0, tzinfo=BRT_TZ)
-        return int(session_brt.astimezone(timezone.utc).timestamp() * 1000)
+        return self.time_normalizer.get_session_start_server_msc(target_date, hour=9, minute=0)
 
     def initialize_and_recover(self) -> Dict[str, Any]:
         """
@@ -86,7 +90,8 @@ class MarketCollectorEngine:
             self.shutdown()
             raise RuntimeError(f"Falha crítica: Símbolo {self.symbol} não pôde ser selecionado no MT5.")
 
-        self.boot_time_msc = int(datetime.now(timezone.utc).timestamp() * 1000)
+        now_utc = datetime.now(timezone.utc)
+        self.boot_time_msc = self.time_normalizer.utc_datetime_to_server_msc(now_utc)
         ckp = self.spool.get_checkpoints(self.symbol)
         now_msc = self.boot_time_msc
 
@@ -112,9 +117,7 @@ class MarketCollectorEngine:
             
             if now_msc > from_msc:
                 logger.info(f"Recuperando histórico de ticks desde o início da sessão ({from_msc} a {now_msc})...")
-                from_utc = datetime.fromtimestamp(from_msc / 1000.0, tz=timezone.utc)
-                to_utc = datetime.fromtimestamp(now_msc / 1000.0, tz=timezone.utc)
-                raw_historical = self.reader.fetch_ticks_range(self.symbol, from_utc, to_utc)
+                raw_historical = self.reader.fetch_ticks_range(self.symbol, from_msc, now_msc)
                 if raw_historical:
                     rec_ticks = self.reconciler.reconcile_raw_ticks(
                         raw_ticks=raw_historical,
@@ -202,8 +205,7 @@ class MarketCollectorEngine:
             else:
                 from_msc = self._get_session_start_msc()
 
-            from_utc = datetime.fromtimestamp(from_msc / 1000.0, tz=timezone.utc)
-            raw_ticks = self.reader.fetch_ticks_from(self.symbol, from_utc, count=self.config.buffer.batch_size)
+            raw_ticks = self.reader.fetch_ticks_from(self.symbol, from_msc, count=self.config.buffer.batch_size)
 
         if not raw_ticks:
             return 0
