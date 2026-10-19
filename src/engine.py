@@ -10,7 +10,7 @@ except Exception:
     BRT_TZ = timezone(timedelta(hours=-3))
 
 from src.config import AppConfig
-from src.domain.models import Checkpoints
+from src.domain.models import Checkpoints, M2CandleClosed
 from src.connection.mt5_time_normalizer import MT5TimeNormalizer
 from src.connection.mt5_reader import MT5ReadOnlyReader
 from src.buffer.durable_spool import DurableSpool
