@@ -1,4 +1,4 @@
-﻿import signal
+import signal
 import sys
 import time
 import logging
@@ -27,8 +27,13 @@ class CollectorApp:
 
     def run(self):
         logger.info(f"Inicializando win-market-monitor para o ativo {self.config.symbol}...")
-        init_res = self.engine.initialize_and_recover()
-        logger.info(f"Status da inicialização: {init_res}")
+        try:
+            init_res = self.engine.initialize_and_recover()
+            logger.info(f"Status da inicialização: {init_res}")
+        except Exception as e:
+            logger.critical(f"Falha fatal ao inicializar o coletor: {e}", exc_info=True)
+            self.engine.shutdown()
+            sys.exit(1)
 
         poll_seconds = self.config.collector.poll_interval_ms / 1000.0
 
@@ -45,9 +50,14 @@ class CollectorApp:
             logger.error(f"Erro fatal no loop de coleta: {e}", exc_info=True)
         finally:
             logger.info("Executando dreno final de pendências antes da parada...")
-            final_replicated = self.engine.replicate_pending_to_postgres()
-            logger.info(f"Dreno final concluído: {final_replicated} registros replicados.")
-            logger.info("win-market-monitor encerrado com segurança durável.")
+            try:
+                final_replicated = self.engine.replicate_pending_to_postgres()
+                logger.info(f"Dreno final concluído: {final_replicated} registros replicados.")
+            except Exception as e:
+                logger.error(f"Erro ao drenar pendências no encerramento: {e}")
+            finally:
+                self.engine.shutdown()
+                logger.info("win-market-monitor encerrado com segurança durável.")
 
 if __name__ == '__main__':
     app = CollectorApp()

@@ -1,4 +1,4 @@
-﻿from datetime import date, datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from src.domain.models import TradeTick
 from src.storage.postgres_writer import PostgresMarketWriter
 from src.storage.parquet_archiver import ParquetArchiver
@@ -32,36 +32,42 @@ def test_parquet_reconstruction_and_cross_audit_from_postgres(tmp_path):
         for i in range(25)
     ]
 
-    # Inserir no PostgreSQL 17 real
-    writer.write_ticks_batch(ticks)
+    try:
+        # Inserir no PostgreSQL 17 real
+        writer.write_ticks_batch(ticks)
 
-    # Reconstruir os ticks lendo diretamente do PostgreSQL
-    with writer.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-            SELECT symbol, time_msc, tick_fingerprint, time_utc, price, volume_real, flags, trade_side, occurrence_ordinal, provenance
-            FROM market_ticks_raw
-            WHERE tick_fingerprint LIKE 'fp_audit_recon_%'
-            ORDER BY time_msc ASC, occurrence_ordinal ASC;
-            """)
-            rows = cur.fetchall()
+        # Reconstruir os ticks lendo diretamente do PostgreSQL
+        with writer.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                SELECT symbol, time_msc, tick_fingerprint, time_utc, price, volume_real, flags, trade_side, occurrence_ordinal, provenance
+                FROM market_ticks_raw
+                WHERE tick_fingerprint LIKE 'fp_audit_recon_%'
+                ORDER BY time_msc ASC, occurrence_ordinal ASC;
+                """)
+                rows = cur.fetchall()
 
-    reconstructed_ticks = [
-        TradeTick(
-            symbol=r[0], time_msc=r[1], tick_fingerprint=r[2], time_utc=r[3],
-            price=r[4], volume_real=r[5], flags=r[6], trade_side=r[7],
-            occurrence_ordinal=r[8], provenance=r[9]
-        )
-        for r in rows
-    ]
-    assert len(reconstructed_ticks) == 25
+        reconstructed_ticks = [
+            TradeTick(
+                symbol=r[0], time_msc=r[1], tick_fingerprint=r[2], time_utc=r[3],
+                price=r[4], volume_real=r[5], flags=r[6], trade_side=r[7],
+                occurrence_ordinal=r[8], provenance=r[9]
+            )
+            for r in rows
+        ]
+        assert len(reconstructed_ticks) == 25
 
-    # Exportar para Parquet ZSTD e gerar manifest
-    res = archiver.archive_ticks_day(trading_date=trading_date, symbol="WINZ26", ticks=reconstructed_ticks)
-    assert res["status"] == "ARCHIVED_AND_BACKED_UP"
-    assert res["rows"] == 25
+        # Exportar para Parquet ZSTD e gerar manifest
+        res = archiver.archive_ticks_day(trading_date=trading_date, symbol="WINZ26", ticks=reconstructed_ticks)
+        assert res["status"] == "ARCHIVED_AND_BACKED_UP"
+        assert res["rows"] == 25
 
-    parquet_file = archiver.archive_dir / f"ticks/year={trading_date.year:04d}/month={trading_date.month:02d}/day={trading_date.day:02d}/WINZ26_ticks.parquet"
-    manifest_file = archiver.archive_dir / f"ticks/year={trading_date.year:04d}/month={trading_date.month:02d}/day={trading_date.day:02d}/manifest.json"
+        parquet_file = archiver.archive_dir / f"ticks/year={trading_date.year:04d}/month={trading_date.month:02d}/day={trading_date.day:02d}/WINZ26_ticks.parquet"
+        manifest_file = archiver.archive_dir / f"ticks/year={trading_date.year:04d}/month={trading_date.month:02d}/day={trading_date.day:02d}/manifest.json"
 
-    assert archiver.validate_archive_integrity(parquet_file, manifest_file) is True
+        assert archiver.validate_archive_integrity(parquet_file, manifest_file) is True
+    finally:
+        with writer.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM market_ticks_raw WHERE tick_fingerprint LIKE 'fp_audit_recon_%';")
+            conn.commit()

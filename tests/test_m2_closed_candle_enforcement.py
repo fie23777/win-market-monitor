@@ -1,4 +1,4 @@
-﻿import pytest
+import pytest
 from datetime import datetime, timezone, timedelta
 from src.domain.models import M2CandleClosed
 from src.buffer.durable_spool import DurableSpool
@@ -37,18 +37,24 @@ def test_m2_closed_candle_persistence_and_validation(tmp_path):
     # Persistência no buffer local durável
     assert spool.append_candle_m2(candle) is True
 
-    # Persistência no PostgreSQL 17 real
-    assert writer.write_candle_m2(candle) is True
+    try:
+        # Persistência no PostgreSQL 17 real
+        assert writer.write_candle_m2(candle) is True
 
-    # Validar no banco real
-    with writer.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT open, high, low, close, is_closed FROM candles_m2 WHERE symbol = 'WINZ26' AND open_time_utc = %s;", (open_utc,))
-            row = cur.fetchone()
-            assert row is not None
-            assert row[0] == 125000.0
-            assert row[3] == 125020.0
-            assert row[4] is True
+        # Validar no banco real
+        with writer.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT open, high, low, close, is_closed FROM candles_m2 WHERE symbol = 'WINZ26' AND open_time_utc = %s;", (open_utc,))
+                row = cur.fetchone()
+                assert row is not None
+                assert row[0] == 125000.0
+                assert row[3] == 125020.0
+                assert row[4] is True
+    finally:
+        with writer.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM candles_m2 WHERE symbol = 'WINZ26' AND open_time_utc = %s;", (open_utc,))
+            conn.commit()
 
 def test_invalid_candle_prices_are_rejected():
     """Valida que preços incoerentes (ex: low > high) são rejeitados com ValueError."""

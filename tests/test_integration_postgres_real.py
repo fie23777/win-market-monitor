@@ -1,4 +1,4 @@
-﻿import pytest
+import pytest
 from datetime import datetime, timezone, timedelta
 from src.domain.models import TradeTick, M2CandleClosed
 from src.storage.postgres_writer import PostgresMarketWriter
@@ -28,15 +28,21 @@ def test_real_postgres_connection_and_batch_write():
         for i in range(20)
     ]
 
-    inserted = writer.write_ticks_batch(ticks)
-    assert inserted == 20
+    try:
+        inserted = writer.write_ticks_batch(ticks)
+        assert inserted == 20
 
-    # Validar no banco real
-    with writer.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT count(*) FROM market_ticks_raw WHERE symbol = 'WINZ26' AND tick_fingerprint LIKE 'fp_real_pg_%';")
-            count = cur.fetchone()[0]
-            assert count == 20
+        # Validar no banco real
+        with writer.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*) FROM market_ticks_raw WHERE symbol = 'WINZ26' AND tick_fingerprint LIKE 'fp_real_pg_%';")
+                count = cur.fetchone()[0]
+                assert count == 20
+    finally:
+        with writer.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM market_ticks_raw WHERE symbol = 'WINZ26' AND tick_fingerprint LIKE 'fp_real_pg_%';")
+            conn.commit()
 
 def test_real_postgres_deduplication_on_conflict():
     """
@@ -61,12 +67,18 @@ def test_real_postgres_deduplication_on_conflict():
         )
     ]
 
-    writer.write_ticks_batch(single_tick)
-    # Tentar reinserir o mesmo tick
-    writer.write_ticks_batch(single_tick)
+    try:
+        writer.write_ticks_batch(single_tick)
+        # Tentar reinserir o mesmo tick
+        writer.write_ticks_batch(single_tick)
 
-    with writer.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT count(*) FROM market_ticks_raw WHERE tick_fingerprint = 'fp_dedup_real_1';")
-            count = cur.fetchone()[0]
-            assert count == 1, "Tick duplicado no PostgreSQL!"
+        with writer.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*) FROM market_ticks_raw WHERE tick_fingerprint = 'fp_dedup_real_1';")
+                count = cur.fetchone()[0]
+                assert count == 1, "Tick duplicado no PostgreSQL!"
+    finally:
+        with writer.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM market_ticks_raw WHERE tick_fingerprint = 'fp_dedup_real_1';")
+            conn.commit()

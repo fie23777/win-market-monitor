@@ -1,4 +1,4 @@
-﻿from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta
 from src.domain.models import TradeTick
 from src.buffer.durable_spool import DurableSpool
 from src.storage.postgres_writer import PostgresMarketWriter
@@ -39,19 +39,27 @@ def test_startup_preserves_and_drains_existing_spool_records(tmp_path):
     reopened_spool = DurableSpool(db_file)
     
     mock_reader = MagicMock()
+    mock_reader.initialize.return_value = True
     mock_reader.is_connected.return_value = True
+    mock_reader.select_symbol.return_value = True
 
     real_writer = PostgresMarketWriter(host="127.0.0.1", port=5434, database="market_data", user="postgres", password="password")
     engine = MarketCollectorEngine(config=config, reader=mock_reader, spool=reopened_spool, writer=real_writer)
 
-    # O método de inicialização deve drenar os 8 registros pendentes
-    res = engine.initialize_and_recover()
-    assert res["drained_pending_count"] == 8
-    assert len(reopened_spool.get_pending_ticks()) == 0
+    try:
+        # O método de inicialização deve drenar os 8 registros pendentes
+        res = engine.initialize_and_recover()
+        assert res["drained_pending_count"] == 8
+        assert len(reopened_spool.get_pending_ticks()) == 0
 
-    # Validar no PostgreSQL 17 real
-    with real_writer.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT count(*) FROM market_ticks_raw WHERE tick_fingerprint LIKE 'fp_startup_persist_%';")
-            count = cur.fetchone()[0]
-            assert count == 8
+        # Validar no PostgreSQL 17 real
+        with real_writer.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*) FROM market_ticks_raw WHERE tick_fingerprint LIKE 'fp_startup_persist_%';")
+                count = cur.fetchone()[0]
+                assert count == 8
+    finally:
+        with real_writer.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM market_ticks_raw WHERE tick_fingerprint LIKE 'fp_startup_persist_%';")
+            conn.commit()

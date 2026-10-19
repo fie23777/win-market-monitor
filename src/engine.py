@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from src.config import AppConfig
@@ -49,7 +49,21 @@ class MarketCollectorEngine:
         """
         Inicializa conexões e executa recuperação histórica inicial caso haja
         lapso temporal desde o último checkpoint de captura.
+        Falha explicitamente com RuntimeError se o MT5 não puder ser inicializado ou conectado.
         """
+        logger.info(f"Conectando ao terminal MT5 (Modo Somente Leitura) para o ativo {self.symbol}...")
+        if not self.reader.initialize():
+            self.shutdown()
+            raise RuntimeError(f"Falha crítica na inicialização do MT5 para o símbolo {self.symbol}. Conexão não pôde ser estabelecida.")
+
+        if not self.reader.is_connected():
+            self.shutdown()
+            raise RuntimeError(f"Terminal MT5 inicializado, porém desconectado do servidor da corretora para o símbolo {self.symbol}.")
+
+        if not self.reader.select_symbol(self.symbol):
+            self.shutdown()
+            raise RuntimeError(f"Falha crítica: Símbolo {self.symbol} não pôde ser selecionado no MT5.")
+
         ckp = self.spool.get_checkpoints(self.symbol)
         now_msc = int(datetime.now(timezone.utc).timestamp() * 1000)
 
@@ -75,6 +89,17 @@ class MarketCollectorEngine:
 
         self._is_running = True
         return recovery_result
+
+    def shutdown(self) -> None:
+        """
+        Encerramento seguro do engine e liberação explícita da conexão com o MT5.
+        """
+        self._is_running = False
+        try:
+            self.reader.shutdown()
+            logger.info("Conexão com MT5 encerrada com segurança.")
+        except Exception as e:
+            logger.warning(f"Erro ao encerrar conexão MT5: {e}")
 
     def capture_step(self, raw_ticks: Optional[list] = None) -> int:
         """
