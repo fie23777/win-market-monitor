@@ -1,9 +1,10 @@
-﻿import sqlite3
+import sqlite3
 import json
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import List, Optional
 from src.domain.models import TradeTick, M2CandleClosed, Checkpoints
+from src.connection.mt5_time_normalizer import MT5TimeNormalizer
 
 class DurableSpool:
     """
@@ -13,8 +14,9 @@ class DurableSpool:
     - last_replicated_msc: Avança após a confirmação de persistência remota no PostgreSQL.
     """
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, time_normalizer: Optional[MT5TimeNormalizer] = None):
         self.db_path = Path(db_path)
+        self.time_normalizer = time_normalizer or MT5TimeNormalizer()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -85,20 +87,20 @@ class DurableSpool:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE;")
-            inserted_count = 0
-
-            for t in ticks:
-                cursor.execute("""
-                INSERT OR IGNORE INTO spool_ticks (
-                    tick_fingerprint, symbol, time_msc, price, volume_real,
-                    flags, trade_side, occurrence_ordinal, provenance, status, created_at_utc
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?);
-                """, (
+            
+            records = [
+                (
                     t.tick_fingerprint, t.symbol, t.time_msc, t.price, t.volume_real,
                     t.flags, t.trade_side, t.occurrence_ordinal, t.provenance, now_iso
-                ))
-                if cursor.rowcount > 0:
-                    inserted_count += 1
+                )
+                for t in ticks
+            ]
+            cursor.executemany("""
+            INSERT OR IGNORE INTO spool_ticks (
+                tick_fingerprint, symbol, time_msc, price, volume_real,
+                flags, trade_side, occurrence_ordinal, provenance, status, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?);
+            """, records)
 
             # Atualizar checkpoint de captura local
             cursor.execute("""
@@ -110,7 +112,7 @@ class DurableSpool:
             """, (stream_key, max_msc, now_iso))
 
             conn.commit()
-            return inserted_count
+            return len(records)
 
     def append_candle_m2(self, candle: M2CandleClosed) -> bool:
         """Persiste duravelmente um candle M2 fechado no spool local."""
@@ -150,7 +152,7 @@ class DurableSpool:
 
         ticks = []
         for r in rows:
-            t_utc = datetime.fromtimestamp(r["time_msc"] / 1000.0, tz=timezone.utc)
+            t_utc = self.time_normalizer.server_msc_to_utc_datetime(r["time_msc"])
             ticks.append(TradeTick(
                 symbol=r["symbol"],
                 time_msc=r["time_msc"],
@@ -175,12 +177,15 @@ class DurableSpool:
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE;")
             
-            # Atualiza status em blocos
-            placeholders = ",".join("?" for _ in fingerprints)
-            cursor.execute(f"""
-            UPDATE spool_ticks SET status = 'COMMITTED'
-            WHERE tick_fingerprint IN ({placeholders});
-            """, fingerprints)
+            # Atualiza status em blocos limitados para evitar limite de parâmetros SQLite
+            chunk_size = 500
+            for i in range(0, len(fingerprints), chunk_size):
+                chunk = fingerprints[i:i + chunk_size]
+                placeholders = ",".join("?" for _ in chunk)
+                cursor.execute(f"""
+                UPDATE spool_ticks SET status = 'COMMITTED'
+                WHERE tick_fingerprint IN ({placeholders});
+                """, chunk)
 
             cursor.execute("""
             INSERT INTO checkpoints_two_stage (stream_key, last_captured_msc, last_replicated_msc, updated_at_utc)

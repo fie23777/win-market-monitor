@@ -44,7 +44,7 @@ class MarketCollectorEngine:
         self.time_normalizer = time_normalizer or MT5TimeNormalizer(server_timezone=server_tz, market_timezone=market_tz)
 
         self.reader = reader or MT5ReadOnlyReader(time_normalizer=self.time_normalizer)
-        self.spool = spool or DurableSpool(config.buffer.sqlite_path)
+        self.spool = spool or DurableSpool(config.buffer.sqlite_path, time_normalizer=self.time_normalizer)
         self.writer = writer or PostgresMarketWriter(
             host=config.postgres.host,
             port=config.postgres.port,
@@ -104,7 +104,7 @@ class MarketCollectorEngine:
             self.shutdown()
             raise RuntimeError(f"Inconsistência crítica: last_replicated_msc ({ckp.last_replicated_msc}) > last_captured_msc ({ckp.last_captured_msc}). Spool corrompido.")
 
-        recovery_result = {"status": "INITIALIZED", "recovered_count": 0}
+        recovery_result = {"status": "INITIALIZED", "recovered_count": 0, "candles_m2_count": 0}
 
         # 2. Determinar ponto de partida inicial
         session_start_msc = self._get_session_start_msc()
@@ -126,7 +126,11 @@ class MarketCollectorEngine:
                         cutoff_realtime_msc=self.boot_time_msc
                     )
                     if rec_ticks:
-                        self.spool.append_ticks_batch(rec_ticks, stream_key=self.symbol)
+                        # Inserir no spool em lotes controlados
+                        chunk_size = 10000
+                        for i in range(0, len(rec_ticks), chunk_size):
+                            chunk = rec_ticks[i:i + chunk_size]
+                            self.spool.append_ticks_batch(chunk, stream_key=self.symbol)
                         recovery_result["recovered_count"] = len(rec_ticks)
                         recovery_result["status"] = "RECOVERED_HISTORICAL_ON_STARTUP"
                 else:
@@ -145,16 +149,72 @@ class MarketCollectorEngine:
             )
             if res.get("recovered_ticks"):
                 rec_ticks = res["recovered_ticks"]
-                self.spool.append_ticks_batch(rec_ticks, stream_key=self.symbol)
+                chunk_size = 10000
+                for i in range(0, len(rec_ticks), chunk_size):
+                    chunk = rec_ticks[i:i + chunk_size]
+                    self.spool.append_ticks_batch(chunk, stream_key=self.symbol)
                 recovery_result["recovered_count"] = len(rec_ticks)
                 recovery_result["status"] = "RECOVERED_ON_STARTUP"
 
-        # Drenar pendências que ficaram do último encerramento
-        replicated = self.replicate_pending_to_postgres()
-        recovery_result["drained_pending_count"] = replicated
+        # Sincronizar candles M2 fechados
+        try:
+            m2_count = self.sync_m2_candles()
+            recovery_result["candles_m2_count"] = m2_count
+        except Exception as e:
+            logger.warning(f"Aviso na sincronização de candles M2: {e}")
+
+        # Drenar pendências para o PostgreSQL em lotes controlados
+        replicated_total = 0
+        drain_chunk_size = 5000
+        while True:
+            rep = self.replicate_pending_to_postgres(batch_size=drain_chunk_size)
+            if rep == 0:
+                break
+            replicated_total += rep
+        recovery_result["drained_pending_count"] = replicated_total
 
         self._is_running = True
         return recovery_result
+
+    def sync_m2_candles(self) -> int:
+        """
+        Sincroniza candles M2 fechados do MT5 para o dia de hoje,
+        convertendo os limites temporais via MT5TimeNormalizer e persistindo no PostgreSQL.
+        """
+        target_date = datetime.now(timezone.utc).astimezone(self.time_normalizer.market_tz).date()
+        session_start_msc = self._get_session_start_msc(target_date)
+        now_server_msc = self.time_normalizer.utc_datetime_to_server_msc(datetime.now(timezone.utc))
+
+        rates = self.reader.fetch_rates_range(self.symbol, 2, session_start_msc, now_server_msc) # 2 = TIMEFRAME_M2
+        if not rates:
+            return 0
+
+        synced = 0
+        now_server_sec = now_server_msc // 1000
+        for r in rates:
+            candle_sec = int(r["time"])
+            # Considerar fechado se o tempo de encerramento (candle_sec + 120s) for <= now_server_sec
+            if candle_sec + 120 <= now_server_sec:
+                open_utc = self.time_normalizer.server_seconds_to_utc_datetime(candle_sec)
+                close_utc = open_utc + timedelta(minutes=2)
+                candle = M2CandleClosed(
+                    symbol=self.symbol,
+                    open_time_utc=open_utc,
+                    close_time_utc=close_utc,
+                    open=r["open"],
+                    high=r["high"],
+                    low=r["low"],
+                    close=r["close"],
+                    volume_real=r["real_volume"],
+                    tick_volume=r["tick_volume"],
+                    spread=r["spread"],
+                    is_closed=True,
+                    provenance="RECOVERED_HISTORICAL_MT5"
+                )
+                self.spool.append_candle_m2(candle)
+                self.writer.write_candle_m2(candle)
+                synced += 1
+        return synced
 
     def shutdown(self) -> None:
         """
