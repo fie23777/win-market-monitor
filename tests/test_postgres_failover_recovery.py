@@ -1,4 +1,4 @@
-﻿from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta
 from src.domain.models import TradeTick
 from src.buffer.durable_spool import DurableSpool
 from src.storage.postgres_writer import PostgresMarketWriter
@@ -6,7 +6,7 @@ from src.config import load_config
 from src.engine import MarketCollectorEngine
 from unittest.mock import MagicMock
 
-def test_postgres_failover_and_recovery(tmp_path):
+def test_postgres_failover_and_recovery(tmp_path, test_postgres_writer):
     """
     Comprova que uma queda do PostgreSQL não interrompe a captura local
     e que todos os dados são drenados para o PostgreSQL após o restabelecimento.
@@ -16,7 +16,7 @@ def test_postgres_failover_and_recovery(tmp_path):
     config = load_config()
 
     # 1. Simular PostgreSQL temporariamente indisponível (porta inválida 5499)
-    broken_writer = PostgresMarketWriter(host="127.0.0.1", port=5499, database="market_data", user="postgres", password="password")
+    broken_writer = PostgresMarketWriter(host="127.0.0.1", port=5499, database="market_data_test", user="postgres", password="password")
     
     mock_reader = MagicMock()
     mock_reader.is_connected.return_value = True
@@ -41,15 +41,21 @@ def test_postgres_failover_and_recovery(tmp_path):
     assert replicated_failed == 0
     assert len(spool.get_pending_ticks()) == 15
 
-    # 2. Restabelecimento da conexão com o PostgreSQL 17 real (porta 5434)
-    real_writer = PostgresMarketWriter(host="127.0.0.1", port=5434, database="market_data", user="postgres", password="password")
+    # 2. Restabelecimento da conexão com o banco isolado de teste (market_data_test)
+    real_writer = test_postgres_writer
     engine.writer = real_writer
 
-    # Dreno automático pós-restabelecimento
-    replicated_success = engine.replicate_pending_to_postgres()
-    assert replicated_success == 15
+    try:
+        # Dreno automático pós-restabelecimento
+        replicated_success = engine.replicate_pending_to_postgres()
+        assert replicated_success == 15
 
-    ckp2 = spool.get_checkpoints("WINZ26")
-    assert ckp2.last_captured_msc == 1791882200280
-    assert ckp2.last_replicated_msc == 1791882200280
-    assert len(spool.get_pending_ticks()) == 0
+        ckp2 = spool.get_checkpoints("WINZ26")
+        assert ckp2.last_captured_msc == 1791882200280
+        assert ckp2.last_replicated_msc == 1791882200280
+        assert len(spool.get_pending_ticks()) == 0
+    finally:
+        with test_postgres_writer.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM market_ticks_raw WHERE time_msc >= 1791882200000 AND time_msc <= 1791882200280;")
+            conn.commit()

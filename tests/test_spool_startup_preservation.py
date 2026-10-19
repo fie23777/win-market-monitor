@@ -6,7 +6,7 @@ from src.config import load_config
 from src.engine import MarketCollectorEngine
 from unittest.mock import MagicMock
 
-def test_startup_preserves_and_drains_existing_spool_records(tmp_path):
+def test_startup_preserves_and_drains_existing_spool_records(tmp_path, test_postgres_writer):
     """
     Comprova que na inicialização o coletor NUNCA apaga o spool local existente,
     mas sim identifica registros pendentes do encerramento anterior e os replica.
@@ -43,7 +43,7 @@ def test_startup_preserves_and_drains_existing_spool_records(tmp_path):
     mock_reader.is_connected.return_value = True
     mock_reader.select_symbol.return_value = True
 
-    real_writer = PostgresMarketWriter(host="127.0.0.1", port=5434, database="market_data", user="postgres", password="password")
+    real_writer = test_postgres_writer
     engine = MarketCollectorEngine(config=config, reader=mock_reader, spool=reopened_spool, writer=real_writer)
 
     try:

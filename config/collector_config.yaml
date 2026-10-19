@@ -1,4 +1,4 @@
-﻿symbol: "WINZ26"
+symbol: "WINZ26"
 timezones:
   storage: "UTC"
   display: "America/Sao_Paulo"
@@ -19,7 +19,7 @@ postgres:
 
 parquet:
   archive_dir: "data/archive"
-  backup_dir: "data/backup"
+  backup_dir: "F:/win-market-monitor-backup"
   compression: "zstd"
   compression_level: 7
   ticks_retention_years: 1

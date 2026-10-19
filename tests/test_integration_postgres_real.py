@@ -3,13 +3,13 @@ from datetime import datetime, timezone, timedelta
 from src.domain.models import TradeTick, M2CandleClosed
 from src.storage.postgres_writer import PostgresMarketWriter
 
-def test_real_postgres_connection_and_batch_write():
+def test_real_postgres_connection_and_batch_write(test_postgres_writer):
     """
     Teste Integrado Ponta a Ponta:
-    Conecta no PostgreSQL 17 real no Docker (porta 5434), cria partição dinâmica,
+    Conecta no banco isolado de teste PostgreSQL 17 (market_data_test), cria partição dinâmica,
     grava lote de TradeTicks e valida contagem e integridade.
     """
-    writer = PostgresMarketWriter(host="127.0.0.1", port=5434, database="market_data", user="postgres", password="password")
+    writer = test_postgres_writer
     
     t_utc = datetime(2026, 10, 19, 14, 0, 0, tzinfo=timezone.utc)
     ticks = [
@@ -32,7 +32,7 @@ def test_real_postgres_connection_and_batch_write():
         inserted = writer.write_ticks_batch(ticks)
         assert inserted == 20
 
-        # Validar no banco real
+        # Validar no banco de teste
         with writer.get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT count(*) FROM market_ticks_raw WHERE symbol = 'WINZ26' AND tick_fingerprint LIKE 'fp_real_pg_%';")
@@ -44,12 +44,12 @@ def test_real_postgres_connection_and_batch_write():
                 cur.execute("DELETE FROM market_ticks_raw WHERE symbol = 'WINZ26' AND tick_fingerprint LIKE 'fp_real_pg_%';")
             conn.commit()
 
-def test_real_postgres_deduplication_on_conflict():
+def test_real_postgres_deduplication_on_conflict(test_postgres_writer):
     """
     Comprova que a re-inserção de ticks já existentes é descartada
     pelo PostgreSQL via ON CONFLICT DO NOTHING sem duplicar dados.
     """
-    writer = PostgresMarketWriter(host="127.0.0.1", port=5434, database="market_data", user="postgres", password="password")
+    writer = test_postgres_writer
     t_utc = datetime(2026, 10, 19, 14, 5, 0, tzinfo=timezone.utc)
 
     single_tick = [

@@ -1,4 +1,5 @@
-﻿import logging
+import os
+import logging
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -15,6 +16,10 @@ from src.storage.parquet_archiver import ParquetArchiver
 
 logger = logging.getLogger(__name__)
 
+class OperationalDatabaseProtectionError(RuntimeError):
+    """Exceção levantada para impedir que ambientes de teste acessem o banco de dados operacional."""
+    pass
+
 class SafeDropViolationError(Exception):
     """Exceção levantada quando uma partição é elegível para drop mas não cumpre as 4 salvaguardas."""
     pass
@@ -25,19 +30,34 @@ class PostgresMarketWriter:
     de particionamento diário sob a política de Safe Drop de 30 pregões B3.
     """
 
+    OPERATIONAL_DB_NAME = "market_data"
+
     def __init__(
         self,
         host: str = "localhost",
-        port: int = 5432,
-        database: str = "market_data",
+        port: int = 5434,
+        database: Optional[str] = None,
         user: str = "postgres",
         password: str = "password",
         archiver: Optional[ParquetArchiver] = None
     ):
+        # Salvaguarda Fail-Closed: se estiver executando sob pytest ou com WIN_MARKET_ENV=test,
+        # proíbe terminantemente apontar para o banco operacional 'market_data'.
+        is_test_env = bool(os.getenv("PYTEST_CURRENT_TEST") or os.getenv("WIN_MARKET_ENV") == "test")
+        if database is None:
+            resolved_db = "market_data_test" if is_test_env else self.OPERATIONAL_DB_NAME
+        else:
+            resolved_db = database
+
+        if is_test_env and resolved_db == self.OPERATIONAL_DB_NAME:
+            raise OperationalDatabaseProtectionError(
+                f"PROTEÇÃO FAIL-CLOSED ATIVA: Tentativa de teste conectar ou escrever no banco de dados operacional '{resolved_db}' foi bloqueada!"
+            )
+
         self.conn_params = {
             "host": host,
             "port": port,
-            "dbname": database,
+            "dbname": resolved_db,
             "user": user,
             "password": password,
         }
@@ -46,6 +66,13 @@ class PostgresMarketWriter:
     def get_connection(self):
         if psycopg2 is None:
             raise RuntimeError("psycopg2 não instalado.")
+
+        is_test_env = bool(os.getenv("PYTEST_CURRENT_TEST") or os.getenv("WIN_MARKET_ENV") == "test")
+        if is_test_env and self.conn_params.get("dbname") == self.OPERATIONAL_DB_NAME:
+            raise OperationalDatabaseProtectionError(
+                f"PROTEÇÃO FAIL-CLOSED ATIVA: Conexão de teste ao banco de dados operacional '{self.OPERATIONAL_DB_NAME}' foi rejeitada!"
+            )
+
         conn = psycopg2.connect(**self.conn_params)
         conn.autocommit = False
         return conn

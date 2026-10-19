@@ -1,13 +1,23 @@
-﻿from datetime import datetime, timezone
+from datetime import datetime, timezone
 from collections import defaultdict
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Tuple, Any, Optional
 from src.domain.models import TradeTick, compute_tick_event_signature, compute_tick_fingerprint
+
+# Constantes de flags oficiais do MetaTrader 5
+TICK_FLAG_BID = 2
+TICK_FLAG_ASK = 4
+TICK_FLAG_LAST = 8
+TICK_FLAG_VOLUME = 16
+TICK_FLAG_BUY = 32
+TICK_FLAG_SELL = 64
+TRADE_FLAGS_MASK = TICK_FLAG_LAST | TICK_FLAG_VOLUME | TICK_FLAG_BUY | TICK_FLAG_SELL
 
 class TickReconciler:
     """
     Reconciliador determinístico de ticks baseado em Assinatura de Evento e Multiplicidade Temporal.
     Garante que múltiplos negócios genuínos com campos idênticos no mesmo milissegundo sejam preservados,
     enquanto requisições sobrepostas não gerem duplicações.
+    Filtra estritamente atualizações exclusivas de book (BID/ASK) persistindo apenas negócios válidos.
     """
 
     def __init__(self, memory_retention_ms: int = 120_000):
@@ -16,20 +26,35 @@ class TickReconciler:
         self._emitted_multiplicity: Dict[Tuple[int, str], int] = defaultdict(int)
         self._last_seen_msc: int = 0
 
+    @staticmethod
+    def is_trade_tick(flags: int, price: float, volume_real: float) -> bool:
+        """
+        Validação positiva de negócio segundo a semântica do MetaTrader 5:
+        1. Deve conter ao menos uma flag indicativa de negócio (LAST, VOLUME, BUY ou SELL).
+        2. Atualizações exclusivas de cotação (BID, ASK ou BID|ASK) são rejeitadas.
+        3. Preço e volume devem ser estritamente positivos (> 0.0).
+        """
+        if not (flags & TRADE_FLAGS_MASK):
+            return False
+        if price <= 0.0 or volume_real <= 0.0:
+            return False
+        return True
+
     def reconcile_raw_ticks(
         self,
         raw_ticks: List[Dict[str, Any]],
         symbol: str,
-        provenance: str = "REALTIME_STREAM"
+        provenance: str = "REALTIME_STREAM",
+        cutoff_realtime_msc: Optional[int] = None
     ) -> List[TradeTick]:
         """
-        Processa um lote de ticks brutos do MT5 e emite exclusivamente
-        novos TradeTicks dedupicados por multiplicidade.
+        Processa um lote de ticks brutos do MT5, filtra atualizações exclusivas de BID/ASK
+        e emite exclusivamente novos TradeTicks de negócios dedupicados por multiplicidade.
         """
         if not raw_ticks:
             return []
 
-        # 1. Agrupar ticks do lote por (time_msc, event_signature) preservando ordem
+        # 1. Filtrar e agrupar ticks de negócio por (time_msc, event_signature) preservando ordem
         batch_groups: Dict[Tuple[int, str], List[Dict[str, Any]]] = defaultdict(list)
         
         for rt in raw_ticks:
@@ -37,9 +62,20 @@ class TickReconciler:
             price = float(rt.get("last", rt.get("price", 0.0)))
             volume_real = float(rt.get("volume_real", rt.get("volume", 0.0)))
             flags = int(rt.get("flags", 0))
+
+            # Filtro estrito: descartar ticks de cotação pura ou sem volume/preço
+            if not self.is_trade_tick(flags, price, volume_real):
+                continue
+
             trade_side = self._determine_trade_side(flags)
-            
             sig = compute_tick_event_signature(time_msc, price, volume_real, flags, trade_side)
+            
+            # Determinação estrita de proveniência: ticks ocorridos antes do cutoff nunca são tempo real
+            if cutoff_realtime_msc is not None and time_msc < cutoff_realtime_msc:
+                tick_prov = "RECOVERED_HISTORICAL_MT5"
+            else:
+                tick_prov = provenance
+
             batch_groups[(time_msc, sig)].append({
                 "time_msc": time_msc,
                 "price": price,
@@ -47,6 +83,7 @@ class TickReconciler:
                 "flags": flags,
                 "trade_side": trade_side,
                 "sig": sig,
+                "provenance": tick_prov,
             })
             if time_msc > self._last_seen_msc:
                 self._last_seen_msc = time_msc
@@ -77,7 +114,7 @@ class TickReconciler:
                         occurrence_ordinal=ordinal,
                         event_signature=sig,
                         tick_fingerprint=fp,
-                        provenance=provenance,
+                        provenance=inst["provenance"],
                     )
                     reconciled_ticks.append(tt)
 
@@ -91,11 +128,15 @@ class TickReconciler:
         return reconciled_ticks
 
     def _determine_trade_side(self, flags: int) -> str:
-        """Determina o lado agressor com base nas flags MT5."""
-        # MT5 TICK_FLAG_BUY = 32, TICK_FLAG_SELL = 64
-        if flags & 32:
+        """
+        Determina o lado agressor com base exclusiva nas flags MT5.
+        Nunca infere compra ou venda sem evidência explícita.
+        """
+        is_buy = bool(flags & TICK_FLAG_BUY)
+        is_sell = bool(flags & TICK_FLAG_SELL)
+        if is_buy and not is_sell:
             return "BUY"
-        elif flags & 64:
+        elif is_sell and not is_buy:
             return "SELL"
         return "CROSS"
 

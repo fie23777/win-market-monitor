@@ -3,12 +3,12 @@ from src.domain.models import TradeTick
 from src.storage.postgres_writer import PostgresMarketWriter
 from src.storage.parquet_archiver import ParquetArchiver
 
-def test_parquet_reconstruction_and_cross_audit_from_postgres(tmp_path):
+def test_parquet_reconstruction_and_cross_audit_from_postgres(tmp_path, test_postgres_writer):
     """
-    Comprova que os dados gravados no PostgreSQL 17 real podem ser exportados
-    para Parquet/ZSTD com manifest SHA-256 e auditados com correspondência de 100%.
+    Comprova que os dados gravados no PostgreSQL 17 isolado de teste (market_data_test)
+    podem ser exportados para Parquet/ZSTD com manifest SHA-256 e auditados com correspondência de 100%.
     """
-    writer = PostgresMarketWriter(host="127.0.0.1", port=5434, database="market_data", user="postgres", password="password")
+    writer = test_postgres_writer
     archive_dir = tmp_path / "archive"
     backup_dir = tmp_path / "backup"
     archiver = ParquetArchiver(archive_dir=archive_dir, backup_dir=backup_dir, compression_level=7)

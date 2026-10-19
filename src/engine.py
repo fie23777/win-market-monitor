@@ -1,6 +1,14 @@
+import time
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from typing import Dict, Any, Optional
+
+try:
+    import zoneinfo
+    BRT_TZ = zoneinfo.ZoneInfo("America/Sao_Paulo")
+except Exception:
+    BRT_TZ = timezone(timedelta(hours=-3))
+
 from src.config import AppConfig
 from src.domain.models import Checkpoints
 from src.connection.mt5_reader import MT5ReadOnlyReader
@@ -44,12 +52,26 @@ class MarketCollectorEngine:
             inactivity_threshold_seconds=config.collector.gap_inactivity_threshold_seconds
         )
         self._is_running = False
+        self.boot_time_msc: int = 0
+
+    def _get_session_start_msc(self, target_date: Optional[date] = None) -> int:
+        """
+        Retorna o instante em milissegundos UTC do início da sessão de negociação (09:00 BRT).
+        Para 19/10/2026 às 09:00 BRT -> 12:00 UTC (1792411200000 msc).
+        Garante que a captura nunca inicie na época de 1970 na ausência de checkpoint.
+        """
+        now_utc = datetime.now(timezone.utc)
+        if target_date is None:
+            target_date = now_utc.astimezone(BRT_TZ).date()
+        session_brt = datetime(target_date.year, target_date.month, target_date.day, 9, 0, 0, tzinfo=BRT_TZ)
+        return int(session_brt.astimezone(timezone.utc).timestamp() * 1000)
 
     def initialize_and_recover(self) -> Dict[str, Any]:
         """
         Inicializa conexões e executa recuperação histórica inicial caso haja
-        lapso temporal desde o último checkpoint de captura.
-        Falha explicitamente com RuntimeError se o MT5 não puder ser inicializado ou conectado.
+        lapso temporal desde o início da sessão ou desde o último checkpoint de captura.
+        Falha explicitamente com RuntimeError se o MT5 não puder ser inicializado ou se
+        houver inconsistência/corrupção de checkpoint.
         """
         logger.info(f"Conectando ao terminal MT5 (Modo Somente Leitura) para o ativo {self.symbol}...")
         if not self.reader.initialize():
@@ -64,12 +86,53 @@ class MarketCollectorEngine:
             self.shutdown()
             raise RuntimeError(f"Falha crítica: Símbolo {self.symbol} não pôde ser selecionado no MT5.")
 
+        self.boot_time_msc = int(datetime.now(timezone.utc).timestamp() * 1000)
         ckp = self.spool.get_checkpoints(self.symbol)
-        now_msc = int(datetime.now(timezone.utc).timestamp() * 1000)
+        now_msc = self.boot_time_msc
+
+        # 1. Validação estrita de integridade dos checkpoints
+        if ckp.last_captured_msc < 0 or ckp.last_replicated_msc < 0:
+            self.shutdown()
+            raise RuntimeError(f"Inconsistência crítica: checkpoints com valores negativos (capturado={ckp.last_captured_msc}, replicado={ckp.last_replicated_msc}).")
+
+        if ckp.last_replicated_msc > ckp.last_captured_msc:
+            self.shutdown()
+            raise RuntimeError(f"Inconsistência crítica: last_replicated_msc ({ckp.last_replicated_msc}) > last_captured_msc ({ckp.last_captured_msc}). Spool corrompido.")
 
         recovery_result = {"status": "INITIALIZED", "recovered_count": 0}
 
-        if ckp.last_captured_msc > 0:
+        # 2. Determinar ponto de partida inicial
+        session_start_msc = self._get_session_start_msc()
+
+        if ckp.last_captured_msc == 0:
+            # Ausência legítima de checkpoint (primeiro boot frio)
+            # Iniciar estritamente no início do pregão configurado (09:00 BRT / 12:00 UTC), NUNCA em 1970
+            from_msc = session_start_msc
+            logger.info(f"Primeiro boot sem checkpoint para {self.symbol}. Ancorando no início da sessão (09:00 BRT): {from_msc} msc...")
+            
+            if now_msc > from_msc:
+                logger.info(f"Recuperando histórico de ticks desde o início da sessão ({from_msc} a {now_msc})...")
+                from_utc = datetime.fromtimestamp(from_msc / 1000.0, tz=timezone.utc)
+                to_utc = datetime.fromtimestamp(now_msc / 1000.0, tz=timezone.utc)
+                raw_historical = self.reader.fetch_ticks_range(self.symbol, from_utc, to_utc)
+                if raw_historical:
+                    rec_ticks = self.reconciler.reconcile_raw_ticks(
+                        raw_ticks=raw_historical,
+                        symbol=self.symbol,
+                        provenance="RECOVERED_HISTORICAL_MT5",
+                        cutoff_realtime_msc=self.boot_time_msc
+                    )
+                    if rec_ticks:
+                        self.spool.append_ticks_batch(rec_ticks, stream_key=self.symbol)
+                        recovery_result["recovered_count"] = len(rec_ticks)
+                        recovery_result["status"] = "RECOVERED_HISTORICAL_ON_STARTUP"
+                else:
+                    if self.reader.is_connected():
+                        recovery_result["status"] = "CONFIRMED_ZERO_MARKET_VOLUME"
+                    else:
+                        recovery_result["status"] = "UNRECOVERED_GAP"
+        else:
+            # Checkpoint prévio existente: avaliar gap contextual
             logger.info(f"Retomando coleta a partir do checkpoint {ckp.last_captured_msc}...")
             res = self.gap_manager.evaluate_and_recover(
                 symbol=self.symbol,
@@ -101,25 +164,57 @@ class MarketCollectorEngine:
         except Exception as e:
             logger.warning(f"Erro ao encerrar conexão MT5: {e}")
 
+    def _attempt_mt5_reconnect(self, max_attempts: int = 3, base_backoff_sec: float = 0.5) -> bool:
+        """
+        Executa rotina de reconexão controlada com backoff exponencial limitado.
+        """
+        logger.info("Iniciando rotina de reconexão controlada ao MT5...")
+        for attempt in range(1, max_attempts + 1):
+            sleep_time = base_backoff_sec * (2 ** (attempt - 1))
+            time.sleep(sleep_time)
+            try:
+                self.reader.shutdown()
+                if self.reader.initialize() and self.reader.is_connected() and self.reader.select_symbol(self.symbol):
+                    logger.info(f"Reconexão ao MT5 restabelecida com sucesso na tentativa {attempt}.")
+                    return True
+            except Exception as e:
+                logger.warning(f"Tentativa {attempt} de reconexão falhou: {e}")
+        logger.error(f"Esgotadas {max_attempts} tentativas de reconexão ao MT5.")
+        return False
+
     def capture_step(self, raw_ticks: Optional[list] = None) -> int:
         """
         Estágio 1: Captura e grava duravelmente no buffer local SQLite WAL.
         Avança last_captured_msc.
+        Diferencia ausência legítima de negócios de desconexão do MT5.
         """
         if raw_ticks is None:
-            # Consulta MT5 real a partir do último cursor de captura
+            # Verificar conectividade ativa do MT5 antes da consulta
+            if not self.reader.is_connected():
+                logger.warning(f"Desconexão do terminal MT5 detectada durante captura de {self.symbol}.")
+                reconnected = self._attempt_mt5_reconnect()
+                if not reconnected:
+                    return 0
+
             ckp = self.spool.get_checkpoints(self.symbol)
-            from_utc = datetime.fromtimestamp(max(ckp.last_captured_msc, 0) / 1000.0, tz=timezone.utc)
+            if ckp.last_captured_msc > 0:
+                from_msc = ckp.last_captured_msc
+            else:
+                from_msc = self._get_session_start_msc()
+
+            from_utc = datetime.fromtimestamp(from_msc / 1000.0, tz=timezone.utc)
             raw_ticks = self.reader.fetch_ticks_from(self.symbol, from_utc, count=self.config.buffer.batch_size)
 
         if not raw_ticks:
             return 0
 
-        # Reconciliar por multiplicidade de ocorrências e assinar determinística
+        # Reconciliar por multiplicidade de ocorrências e filtrar negócios
+        cutoff = self.boot_time_msc if self.boot_time_msc > 0 else None
         reconciled = self.reconciler.reconcile_raw_ticks(
             raw_ticks=raw_ticks,
             symbol=self.symbol,
-            provenance="REALTIME_STREAM"
+            provenance="REALTIME_STREAM",
+            cutoff_realtime_msc=cutoff
         )
 
         if not reconciled:

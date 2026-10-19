@@ -4,14 +4,14 @@ from src.domain.models import M2CandleClosed
 from src.buffer.durable_spool import DurableSpool
 from src.storage.postgres_writer import PostgresMarketWriter
 
-def test_m2_closed_candle_persistence_and_validation(tmp_path):
+def test_m2_closed_candle_persistence_and_validation(tmp_path, test_postgres_writer):
     """
     Comprova a regra estrita de que apenas candles M2 completamente fechados
-    são validados e persistidos no SQLite WAL e no PostgreSQL 17 real.
+    são validados e persistidos no SQLite WAL e no PostgreSQL 17 de testes (market_data_test).
     """
     db_file = tmp_path / "candle_test.db"
     spool = DurableSpool(db_file)
-    writer = PostgresMarketWriter(host="127.0.0.1", port=5434, database="market_data", user="postgres", password="password")
+    writer = test_postgres_writer
 
     open_utc = datetime(2026, 10, 19, 12, 0, 0, tzinfo=timezone.utc)
     close_utc = datetime(2026, 10, 19, 12, 2, 0, tzinfo=timezone.utc)

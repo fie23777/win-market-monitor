@@ -1,4 +1,4 @@
-﻿import os
+import os
 import yaml
 from pathlib import Path
 from dataclasses import dataclass
@@ -52,11 +52,16 @@ def load_config(config_path: str | Path = None) -> AppConfig:
     with open(config_path, 'r', encoding='utf-8') as f:
         data = yaml.safe_load(f)
         
+    is_test_env = bool(os.getenv("PYTEST_CURRENT_TEST") or os.getenv("WIN_MARKET_ENV") == "test")
+    pg_data = data.get("postgres", {})
+    if is_test_env and pg_data.get("database") == "market_data":
+        pg_data["database"] = os.getenv("TEST_PG_DB", "market_data_test")
+
     return AppConfig(
         symbol=data.get("symbol", "WINZ26"),
         timezones=data.get("timezones", {"storage": "UTC", "display": "America/Sao_Paulo"}),
         buffer=BufferConfig(**data.get("buffer", {})),
-        postgres=PostgresConfig(**data.get("postgres", {})),
+        postgres=PostgresConfig(**pg_data),
         parquet=ParquetConfig(**data.get("parquet", {})),
         collector=CollectorSettings(**data.get("collector", {})),
     )
