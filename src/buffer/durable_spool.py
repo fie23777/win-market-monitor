@@ -284,3 +284,26 @@ class DurableSpool:
             rows = cursor.fetchall()
             return {r["tick_fingerprint"] for r in rows}
 
+    def has_pending_ticks_in_range(self, from_msc: int, to_msc: int, symbol: str = "WINZ26") -> bool:
+        """Verifica se existem negócios ainda com status 'PENDING' no intervalo auditado."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            SELECT 1 FROM spool_ticks
+            WHERE symbol = ? AND time_msc >= ? AND time_msc <= ? AND status = 'PENDING'
+            LIMIT 1;
+            """, (symbol, from_msc, to_msc))
+            return cursor.fetchone() is not None
+
+    def get_oldest_pending_msc(self, symbol: str = "WINZ26") -> Optional[int]:
+        """Retorna o menor time_msc de um negócio com status 'PENDING'."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            SELECT MIN(time_msc) AS min_msc FROM spool_ticks
+            WHERE symbol = ? AND status = 'PENDING';
+            """, (symbol,))
+            row = cursor.fetchone()
+            return row["min_msc"] if row and row["min_msc"] is not None else None
+
+

@@ -38,7 +38,13 @@ class PeriodicHistoricalReconciler:
         self.max_window_ms = max_window_ms
         self.time_normalizer = time_normalizer or MT5TimeNormalizer()
 
-    def reconcile_cycle(self, now_server_msc: int, session_start_msc: int = 0) -> Dict[str, Any]:
+    def reconcile_cycle(
+        self,
+        now_server_msc: int,
+        session_start_msc: int = 0,
+        replicate_fn: Optional[Any] = None
+    ) -> Dict[str, Any]:
+
         """
         Executa um ciclo determinístico de reconciliação periódica.
         Retorna dicionário com o resultado e métricas da varredura.
@@ -115,7 +121,35 @@ class PeriodicHistoricalReconciler:
                 f"no intervalo [{from_msc}, {to_msc}]."
             )
 
-        # Avançar W_complete estritamente até to_msc (cobertura efetivamente auditada)
+        # Se houver função de replicação fornecida, drena pendências para o PostgreSQL imediatamente
+        if replicate_fn is not None and recovered_count > 0:
+            try:
+                replicate_fn()
+            except Exception as e:
+                logger.warning(f"Falha na replicação imediata de recuperados para o PostgreSQL: {e}")
+
+        # Condição Estrita de Avanço de W_complete:
+        # Só avança se NÃO houver pendências (status PENDING) no intervalo auditado.
+        has_pending = self.spool.has_pending_ticks_in_range(from_msc, to_msc, self.symbol)
+        if has_pending:
+            logger.warning(
+                f"W_complete RETIDO: Existem negócios com status PENDING no intervalo [{from_msc}, {to_msc}]. "
+                "W_complete não avançará até que todos sejam confirmados (COMMITTED) no PostgreSQL."
+            )
+            return {
+                "status": "RECOVERED_PENDING_REPLICATION",
+                "from_msc": from_msc,
+                "to_msc": to_msc,
+                "scanned_ticks": len(raw_ticks),
+                "recovered_count": recovered_count,
+                "w_complete": ckp.watermark_complete_msc,
+                "w_durable": ckp.last_captured_msc,
+                "pending_replication": True
+            }
+
+
+        # Avançar W_complete estritamente até to_msc somente quando a cobertura histórica estiver verificada
+        # E todos os negócios estiverem efetivamente confirmados no PostgreSQL.
         self.spool.update_complete_watermark(to_msc, stream_key=self.symbol)
 
         return {
@@ -125,5 +159,7 @@ class PeriodicHistoricalReconciler:
             "scanned_ticks": len(raw_ticks),
             "recovered_count": recovered_count,
             "w_complete": to_msc,
-            "w_durable": ckp.last_captured_msc
+            "w_durable": ckp.last_captured_msc,
+            "pending_replication": False
         }
+

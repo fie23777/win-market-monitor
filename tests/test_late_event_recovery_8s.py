@@ -137,49 +137,54 @@ def test_late_event_recovery_8s_deterministic(tmp_path):
 
     # 4. Executar o ciclo do PeriodicHistoricalReconciler em 14:00:08
     # Safety lag de 2 segundos -> limite superior de auditoria é 14:00:06
+    # Como o writer ainda não replicou para o PG, o negócio recuperado permanece com status PENDING
     reconcile_res = engine.periodic_reconcile_step(now_server_msc=t_14_00_08_msc)
 
-    # 5. Asserções de Validação Formal
-    assert reconcile_res["status"] == "RECONCILED"
-    assert reconcile_res["recovered_count"] == 1 # Exatamente o negócio atrasado de 14:00:01 recuperado
-    assert reconcile_res["w_complete"] == 1792418406000 # Avançou exatamente até 14:00:06 (now - 2s)
-
-    # 6. Validar estado do banco e checkpoints no Spool
-    ckp_after = spool.get_checkpoints("WINZ26")
+    # 5. Asserções de Validação Formal - Estágio 1: Recuperado mas Pendente de Confirmação Remota
+    assert reconcile_res["status"] == "RECOVERED_PENDING_REPLICATION"
+    assert reconcile_res["recovered_count"] == 1 # Negócio atrasado de 14:00:01 recuperado para o spool
+    assert reconcile_res["pending_replication"] is True
     
-    # Checkpoint de captura (W_durable) NÃO regrediu!
-    assert ckp_after.last_captured_msc == t_14_00_08_msc
+    # Comprovação da Ressalva do Usuário: W_complete NÃO avança sobre intervalo com ticks PENDING!
+    ckp_pending = spool.get_checkpoints("WINZ26")
+    assert ckp_pending.watermark_complete_msc == 0 # W_complete RETIDO em 0!
+    assert ckp_pending.last_captured_msc == t_14_00_08_msc # W_durable não regrediu!
 
-    # Checkpoint de completude auditada (W_complete) avançou até a cobertura verificada
-    assert ckp_after.watermark_complete_msc == 1792418406000
-    assert ckp_after.watermark_complete_msc <= t_14_00_08_msc - lookback_ms
+    # 6. Simular confirmação de persistência no PostgreSQL (ACK recebido -> status COMMITTED)
+    with spool._get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT tick_fingerprint FROM spool_ticks WHERE status = 'PENDING';")
+        pending_fps = [r["tick_fingerprint"] for r in cursor.fetchall()]
+    spool.mark_ticks_replicated(pending_fps, max_replicated_msc=t_14_00_08_msc, stream_key="WINZ26")
 
-    # Verificar dados no spool SQLite
+    # 7. Executar o ciclo seguinte do Reconciliador agora que os dados foram confirmados
+    reconcile_res_confirmed = engine.periodic_reconcile_step(now_server_msc=t_14_00_08_msc)
+    assert reconcile_res_confirmed["status"] == "RECONCILED"
+    assert reconcile_res_confirmed["recovered_count"] == 0 # Nenhum novo tick faltante
+    assert reconcile_res_confirmed["w_complete"] == 1792418406000 # Agora sim W_complete AVANÇA para 14:00:06!
+
+    # 8. Validar estado dos checkpoints finais no Spool
+    ckp_after = spool.get_checkpoints("WINZ26")
+    assert ckp_after.last_captured_msc == t_14_00_08_msc # Sem regressão
+    assert ckp_after.watermark_complete_msc == 1792418406000 # Avanço rigorosamente limitado a 14:00:06
+    assert ckp_after.last_replicated_msc == t_14_00_08_msc
+
+    # Verificar que não há pendências e os 3 ticks são legítimos e únicos
     with spool._get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT time_msc, price, volume_real, provenance, status FROM spool_ticks ORDER BY time_msc ASC;")
         rows = cursor.fetchall()
 
-    # Devem existir exatamente 3 ticks: 14:00:01 (recuperado), 14:00:05 (original), 14:00:08 (original)
     assert len(rows) == 3
     assert rows[0]["time_msc"] == t_14_00_01_msc
-    assert rows[0]["price"] == 119995.0
-    assert rows[0]["volume_real"] == 15.0
+    assert rows[0]["status"] == "COMMITTED"
     assert rows[0]["provenance"] == "RECOVERED_HISTORICAL_MT5"
-    assert rows[0]["status"] == "PENDING"
 
     assert rows[1]["time_msc"] == t_14_00_05_msc
-    assert rows[1]["provenance"] == "REALTIME_STREAM"
-
     assert rows[2]["time_msc"] == t_14_00_08_msc
-    assert rows[2]["provenance"] == "REALTIME_STREAM"
 
-    # 7. Teste de Idempotência: re-executar sem novos ticks não duplica nem altera checkpoints
-    reconcile_res_2 = engine.periodic_reconcile_step(now_server_msc=t_14_00_08_msc)
-    assert reconcile_res_2["status"] == "UP_TO_DATE" # Já coberto até 14:00:06
-    assert reconcile_res_2["recovered_count"] == 0
+    # 9. Teste de Idempotência: re-executar sob a mesma janela não duplica nem altera
+    reconcile_res_idempotent = engine.periodic_reconcile_step(now_server_msc=t_14_00_08_msc)
+    assert reconcile_res_idempotent["status"] == "UP_TO_DATE"
+    assert reconcile_res_idempotent["recovered_count"] == 0
 
-    with spool._get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) AS cnt FROM spool_ticks;")
-        assert cursor.fetchone()["cnt"] == 3

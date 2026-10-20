@@ -351,8 +351,10 @@ class MarketCollectorEngine:
 
         return self.periodic_reconciler.reconcile_cycle(
             now_server_msc=now_server_msc,
-            session_start_msc=session_start_msc
+            session_start_msc=session_start_msc,
+            replicate_fn=self.replicate_pending_to_postgres
         )
+
 
 
     def maybe_periodic_reconcile(self, last_run_timestamp: float, interval_sec: float = 60.0) -> tuple[float, Dict[str, Any]]:
