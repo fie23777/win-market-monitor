@@ -70,9 +70,15 @@ class DurableSpool:
                 stream_key TEXT PRIMARY KEY,
                 last_captured_msc INTEGER NOT NULL DEFAULT 0,
                 last_replicated_msc INTEGER NOT NULL DEFAULT 0,
+                watermark_complete_msc INTEGER NOT NULL DEFAULT 0,
                 updated_at_utc TEXT NOT NULL
             );
             """)
+            # Garantir existência da coluna watermark_complete_msc em bases pré-existentes
+            try:
+                conn.execute("ALTER TABLE checkpoints_two_stage ADD COLUMN watermark_complete_msc INTEGER NOT NULL DEFAULT 0;")
+            except Exception:
+                pass  # Coluna já existe
 
     def append_ticks_batch(self, ticks: List[TradeTick], stream_key: str = "WINZ26") -> int:
         """
@@ -202,7 +208,7 @@ class DurableSpool:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-            SELECT stream_key, last_captured_msc, last_replicated_msc, updated_at_utc
+            SELECT stream_key, last_captured_msc, last_replicated_msc, watermark_complete_msc, updated_at_utc
             FROM checkpoints_two_stage
             WHERE stream_key = ?;
             """, (stream_key,))
@@ -214,6 +220,67 @@ class DurableSpool:
                 stream_key=row["stream_key"],
                 last_captured_msc=row["last_captured_msc"],
                 last_replicated_msc=row["last_replicated_msc"],
+                watermark_complete_msc=row["watermark_complete_msc"],
                 updated_at_utc=upd
             )
-        return Checkpoints(stream_key=stream_key, last_captured_msc=0, last_replicated_msc=0)
+        return Checkpoints(stream_key=stream_key, last_captured_msc=0, last_replicated_msc=0, watermark_complete_msc=0)
+
+    def update_complete_watermark(self, complete_msc: int, stream_key: str = "WINZ26") -> None:
+        """
+        Avança o watermark de completude histórica auditada (W_complete).
+        W_complete é monotônico e nunca ultrapassa a janela efetivamente reconciliada.
+        """
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            INSERT INTO checkpoints_two_stage (stream_key, last_captured_msc, last_replicated_msc, watermark_complete_msc, updated_at_utc)
+            VALUES (?, 0, 0, ?, ?)
+            ON CONFLICT(stream_key) DO UPDATE SET
+                watermark_complete_msc = MAX(watermark_complete_msc, excluded.watermark_complete_msc),
+                updated_at_utc = excluded.updated_at_utc;
+            """, (stream_key, complete_msc, now_iso))
+            conn.commit()
+
+    def append_recovered_ticks(self, ticks: List[TradeTick], stream_key: str = "WINZ26") -> int:
+        """
+        Persiste duravelmente ticks recuperados pela reconciliação periódica (sem alterar W_durable / last_captured_msc).
+        Usa status 'PENDING' para que sejam replicados posteriormente ao PostgreSQL.
+        Retorna o número de ticks novos efetivamente inseridos.
+        """
+        if not ticks:
+            return 0
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE;")
+            
+            records = [
+                (
+                    t.tick_fingerprint, t.symbol, t.time_msc, t.price, t.volume_real,
+                    t.flags, t.trade_side, t.occurrence_ordinal, t.provenance, now_iso
+                )
+                for t in ticks
+            ]
+            cursor.executemany("""
+            INSERT OR IGNORE INTO spool_ticks (
+                tick_fingerprint, symbol, time_msc, price, volume_real,
+                flags, trade_side, occurrence_ordinal, provenance, status, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?);
+            """, records)
+            inserted_count = cursor.rowcount
+            conn.commit()
+            return inserted_count
+
+    def get_existing_fingerprints_in_range(self, from_msc: int, to_msc: int, symbol: str = "WINZ26") -> set[str]:
+        """Retorna o conjunto de tick_fingerprint já armazenados no spool para o intervalo."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            SELECT tick_fingerprint FROM spool_ticks
+            WHERE symbol = ? AND time_msc >= ? AND time_msc <= ?;
+            """, (symbol, from_msc, to_msc))
+            rows = cursor.fetchall()
+            return {r["tick_fingerprint"] for r in rows}
+

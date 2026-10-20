@@ -1,0 +1,129 @@
+import logging
+from typing import Optional, Dict, Any, List
+from datetime import datetime, timezone
+from src.domain.models import TradeTick
+from src.connection.mt5_reader import MT5ReadOnlyReader
+
+from src.buffer.durable_spool import DurableSpool
+from src.reconciliation.tick_reconciler import TickReconciler
+from src.connection.mt5_time_normalizer import MT5TimeNormalizer
+
+logger = logging.getLogger("PeriodicHistoricalReconciler")
+
+class PeriodicHistoricalReconciler:
+    """
+    Reconciliador histórico periódico independente.
+    Executa varreduras históricas retrospectivas em segundo plano mesmo sob conexão contínua e estável,
+    detectando e inserindo negócios disponibilizados tardiamente pelo MT5 (atraso > lookback_ms).
+    
+    Mantém separação estrita de watermarks:
+    - W_durable (last_captured_msc): avança no realtime stream de forma estritamente crescente.
+    - W_complete (watermark_complete_msc): avança retrospectivamente apenas até onde a reconciliação
+      histórica comprovou ausência de gaps, respeitando o atraso de segurança (safety_lag_ms).
+    """
+
+    def __init__(
+        self,
+        reader: MT5ReadOnlyReader,
+        spool: DurableSpool,
+        symbol: str,
+        safety_lag_ms: int = 2000,
+        max_window_ms: int = 300_000, # 5 minutos
+        time_normalizer: Optional[MT5TimeNormalizer] = None
+    ):
+        self.reader = reader
+        self.spool = spool
+        self.symbol = symbol
+        self.safety_lag_ms = safety_lag_ms
+        self.max_window_ms = max_window_ms
+        self.time_normalizer = time_normalizer or MT5TimeNormalizer()
+
+    def reconcile_cycle(self, now_server_msc: int, session_start_msc: int = 0) -> Dict[str, Any]:
+        """
+        Executa um ciclo determinístico de reconciliação periódica.
+        Retorna dicionário com o resultado e métricas da varredura.
+        """
+        if not self.reader.is_connected():
+            return {
+                "status": "SKIPPED_DISCONNECTED",
+                "recovered_count": 0,
+                "reason": "MT5 desconectado"
+            }
+
+        ckp = self.spool.get_checkpoints(self.symbol)
+        
+        # Limite superior seguro (não invade a janela realtime sob captura ativa)
+        audit_ceiling_msc = now_server_msc - self.safety_lag_ms
+        if ckp.last_captured_msc > 0:
+            audit_ceiling_msc = min(audit_ceiling_msc, ckp.last_captured_msc)
+
+        # Ponto inicial da janela de reconciliação
+        if ckp.watermark_complete_msc > 0:
+            from_msc = ckp.watermark_complete_msc
+        elif ckp.last_captured_msc > 0:
+            # Sem watermark prévio: iniciar na janela retrospectiva recente (ex: últimos 5 min)
+            base_start = session_start_msc if session_start_msc > 0 else 0
+            from_msc = max(base_start, audit_ceiling_msc - self.max_window_ms)
+        elif session_start_msc > 0:
+            from_msc = session_start_msc
+        else:
+            return {
+                "status": "SKIPPED_NO_BASE_POINT",
+                "recovered_count": 0,
+                "reason": "Sem ponto base de partida"
+            }
+
+        if audit_ceiling_msc <= from_msc:
+            return {
+                "status": "UP_TO_DATE",
+                "recovered_count": 0,
+                "w_complete": ckp.watermark_complete_msc,
+                "w_durable": ckp.last_captured_msc
+            }
+
+
+        # Delimitar janela máxima
+        to_msc = min(from_msc + self.max_window_ms, audit_ceiling_msc)
+
+        # Consultar histórico do MT5 na janela exata
+        raw_ticks = self.reader.fetch_ticks_range(self.symbol, from_msc, to_msc)
+        if raw_ticks is None:
+            return {
+                "status": "FETCH_FAILED",
+                "recovered_count": 0,
+                "reason": "Falha na leitura histórica do MT5"
+            }
+
+        # Reconciliar ticks brutos do MT5
+        reconciler = TickReconciler(time_normalizer=self.time_normalizer)
+        canonical_ticks = reconciler.reconcile_raw_ticks(
+            raw_ticks=raw_ticks,
+            symbol=self.symbol,
+            provenance="RECOVERED_HISTORICAL_MT5"
+        )
+
+        # Identificar existentes no spool local
+        existing_fps = self.spool.get_existing_fingerprints_in_range(from_msc, to_msc, self.symbol)
+        missing_ticks = [t for t in canonical_ticks if t.tick_fingerprint not in existing_fps]
+
+        recovered_count = 0
+        if missing_ticks:
+            # Inserir no buffer local durável SEM regredir nem avançar last_captured_msc
+            recovered_count = self.spool.append_recovered_ticks(missing_ticks, stream_key=self.symbol)
+            logger.info(
+                f"Reconciliador Periódico recuperou {recovered_count} negócios tardios em {self.symbol} "
+                f"no intervalo [{from_msc}, {to_msc}]."
+            )
+
+        # Avançar W_complete estritamente até to_msc (cobertura efetivamente auditada)
+        self.spool.update_complete_watermark(to_msc, stream_key=self.symbol)
+
+        return {
+            "status": "RECONCILED",
+            "from_msc": from_msc,
+            "to_msc": to_msc,
+            "scanned_ticks": len(raw_ticks),
+            "recovered_count": recovered_count,
+            "w_complete": to_msc,
+            "w_durable": ckp.last_captured_msc
+        }

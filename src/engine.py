@@ -15,8 +15,10 @@ from src.connection.mt5_time_normalizer import MT5TimeNormalizer
 from src.connection.mt5_reader import MT5ReadOnlyReader
 from src.buffer.durable_spool import DurableSpool
 from src.reconciliation.tick_reconciler import TickReconciler
+from src.reconciliation.periodic_reconciler import PeriodicHistoricalReconciler
 from src.storage.postgres_writer import PostgresMarketWriter
 from src.recovery.gap_recovery import GapRecoveryManager
+
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +60,17 @@ class MarketCollectorEngine:
             reconciler=self.reconciler,
             inactivity_threshold_seconds=config.collector.gap_inactivity_threshold_seconds
         )
+        self.periodic_reconciler = PeriodicHistoricalReconciler(
+            reader=self.reader,
+            spool=self.spool,
+            symbol=self.symbol,
+            safety_lag_ms=getattr(self.config.collector, "lookback_ms", 2000),
+            max_window_ms=300_000,
+            time_normalizer=self.time_normalizer
+        )
         self._is_running = False
         self.boot_time_msc: int = 0
+
 
     def _get_session_start_msc(self, target_date: Optional[date] = None) -> int:
         """
@@ -322,3 +333,35 @@ class MarketCollectorEngine:
         except Exception as e:
             logger.warning(f"PostgreSQL temporariamente indisponível ({e}). Itens permanecem no spool local durável.")
             return 0
+
+    def periodic_reconcile_step(self, now_server_msc: Optional[int] = None, session_start_msc: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Executa uma passada do reconciliador histórico periódico.
+        Varre retrospectivamente negócios disponibilizados com atraso (atraso > lookback_ms)
+        sem regredir o W_durable (last_captured_msc) e avança W_complete até a cobertura auditada.
+        """
+        if now_server_msc is None:
+            now_utc = datetime.now(timezone.utc)
+            now_server_msc = self.time_normalizer.utc_datetime_to_server_msc(now_utc)
+            
+        if session_start_msc is None:
+            ref_dt = self.time_normalizer.server_msc_to_utc_datetime(now_server_msc)
+            ref_date = ref_dt.astimezone(self.time_normalizer.market_tz).date()
+            session_start_msc = self._get_session_start_msc(ref_date)
+
+        return self.periodic_reconciler.reconcile_cycle(
+            now_server_msc=now_server_msc,
+            session_start_msc=session_start_msc
+        )
+
+
+    def maybe_periodic_reconcile(self, last_run_timestamp: float, interval_sec: float = 60.0) -> tuple[float, Dict[str, Any]]:
+        """
+        Aciona a reconciliação periódica se decorrido o intervalo estipulado.
+        """
+        now = time.time()
+        if now - last_run_timestamp >= interval_sec:
+            res = self.periodic_reconcile_step()
+            return now, res
+        return last_run_timestamp, {"status": "SKIPPED_INTERVAL", "recovered_count": 0}
+

@@ -1,4 +1,4 @@
-﻿from dataclasses import dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 from typing import Optional
@@ -94,5 +94,6 @@ class Checkpoints:
     stream_key: str
     last_captured_msc: int
     last_replicated_msc: int
+    watermark_complete_msc: int = 0
     last_candle_close_utc: Optional[datetime] = None
     updated_at_utc: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
