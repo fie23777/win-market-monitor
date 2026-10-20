@@ -93,11 +93,19 @@ class PeriodicHistoricalReconciler:
 
         # Consultar histórico do MT5 na janela exata
         raw_ticks = self.reader.fetch_ticks_range(self.symbol, from_msc, to_msc)
-        if raw_ticks is None:
+        if raw_ticks is None or not self.reader.is_connected():
+            logger.warning(
+                f"Janela [{from_msc}, {to_msc}] INCONCLUSIVA: dados históricos do MT5 indisponíveis. "
+                "W_complete NÃO avançará sobre lacuna não verificada."
+            )
             return {
-                "status": "FETCH_FAILED",
+                "status": "INCONCLUSIVE",
+                "from_msc": from_msc,
+                "to_msc": to_msc,
                 "recovered_count": 0,
-                "reason": "Falha na leitura histórica do MT5"
+                "w_complete": ckp.watermark_complete_msc,
+                "w_durable": ckp.last_captured_msc,
+                "reason": "Dados históricos indisponíveis ou terminal desconectado no MT5"
             }
 
         # Reconciliar ticks brutos do MT5
@@ -147,10 +155,14 @@ class PeriodicHistoricalReconciler:
                 "pending_replication": True
             }
 
-
         # Avançar W_complete estritamente até to_msc somente quando a cobertura histórica estiver verificada
         # E todos os negócios estiverem efetivamente confirmados no PostgreSQL.
         self.spool.update_complete_watermark(to_msc, stream_key=self.symbol)
+
+        logger.info(
+            f"Reconciliação periódica auditada [{from_msc}, {to_msc}]: {len(raw_ticks)} ticks verificados, "
+            f"{recovered_count} recuperados. W_complete avançou para {to_msc}."
+        )
 
         return {
             "status": "RECONCILED",
@@ -162,4 +174,5 @@ class PeriodicHistoricalReconciler:
             "w_durable": ckp.last_captured_msc,
             "pending_replication": False
         }
+
 
