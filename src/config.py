@@ -34,6 +34,7 @@ class CollectorSettings:
     allow_orders: bool
     poll_interval_ms: int
     gap_inactivity_threshold_seconds: int
+    lookback_ms: int = 2000
 
 @dataclass
 class AppConfig:

@@ -274,10 +274,14 @@ class MarketCollectorEngine:
                     return 0
 
             ckp = self.spool.get_checkpoints(self.symbol)
+            session_start = self._get_session_start_msc()
+            lookback_ms = getattr(self.config.collector, "lookback_ms", 2000)
+            
             if ckp.last_captured_msc > 0:
-                from_msc = ckp.last_captured_msc
+                # Lookback adaptativo para capturar negócios que sofreram jitter de rede
+                from_msc = max(session_start, ckp.last_captured_msc - lookback_ms)
             else:
-                from_msc = self._get_session_start_msc()
+                from_msc = session_start
 
             raw_ticks = self.reader.fetch_ticks_from(self.symbol, from_msc, count=self.config.buffer.batch_size)
 

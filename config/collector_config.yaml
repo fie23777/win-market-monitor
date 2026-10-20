@@ -32,3 +32,4 @@ collector:
   allow_orders: false
   poll_interval_ms: 100
   gap_inactivity_threshold_seconds: 15
+  lookback_ms: 2000
