@@ -36,6 +36,8 @@ class CollectorApp:
             sys.exit(1)
 
         poll_seconds = self.config.collector.poll_interval_ms / 1000.0
+        last_m2_sync = time.time()
+        last_reconcile = time.time()
 
         try:
             while self.keep_running:
@@ -44,9 +46,16 @@ class CollectorApp:
                 
                 # 2. Replicação para o PostgreSQL 17
                 replicated = self.engine.replicate_pending_to_postgres()
+
+                # 3. Sincronização periódica de candles M2
+                last_m2_sync, m2_count = self.engine.maybe_sync_m2_candles(last_m2_sync, interval_sec=60.0)
+
+                # 4. Reconciliação histórica periódica (recuperação de eventos tardios e avanço de W_complete)
+                last_reconcile, rec_res = self.engine.maybe_periodic_reconcile(last_reconcile, interval_sec=60.0)
                 
                 time.sleep(poll_seconds)
         except Exception as e:
+
             logger.error(f"Erro fatal no loop de coleta: {e}", exc_info=True)
         finally:
             logger.info("Executando dreno final de pendências antes da parada...")
