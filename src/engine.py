@@ -150,22 +150,56 @@ class MarketCollectorEngine:
                     else:
                         recovery_result["status"] = "UNRECOVERED_GAP"
         else:
-            # Checkpoint prévio existente: avaliar gap contextual
-            logger.info(f"Retomando coleta a partir do checkpoint {ckp.last_captured_msc}...")
-            res = self.gap_manager.evaluate_and_recover(
-                symbol=self.symbol,
-                last_seen_msc=ckp.last_captured_msc,
-                current_time_msc=now_msc,
-                is_connected=self.reader.is_connected()
-            )
-            if res.get("recovered_ticks"):
-                rec_ticks = res["recovered_ticks"]
-                chunk_size = 10000
-                for i in range(0, len(rec_ticks), chunk_size):
-                    chunk = rec_ticks[i:i + chunk_size]
-                    self.spool.append_ticks_batch(chunk, stream_key=self.symbol)
-                recovery_result["recovered_count"] = len(rec_ticks)
-                recovery_result["status"] = "RECOVERED_ON_STARTUP"
+            # Checkpoint prévio existente: avaliar se pertence ao mesmo pregão ou a sessão anterior
+            ckp_dt = self.time_normalizer.server_msc_to_utc_datetime(ckp.last_captured_msc)
+            ckp_date = ckp_dt.astimezone(self.time_normalizer.market_tz).date()
+            today_date = datetime.now(timezone.utc).astimezone(self.time_normalizer.market_tz).date()
+
+            if ckp_date < today_date:
+                # Transição legítima de pregão: ancorar estritamente no início do dia de hoje (09:00 BRT)
+                logger.info(
+                    f"Transição de sessão detectada: checkpoint prévio ({ckp_date}) pertence a pregão anterior. "
+                    f"Ancorando nova sessão de {today_date} no início oficial (09:00 BRT: {session_start_msc} msc)..."
+                )
+                from_msc = session_start_msc
+                if now_msc > from_msc:
+                    logger.info(f"Recuperando histórico de ticks desde o início da nova sessão ({from_msc} a {now_msc})...")
+                    raw_historical = self.reader.fetch_ticks_range(self.symbol, from_msc, now_msc)
+                    if raw_historical:
+                        rec_ticks = self.reconciler.reconcile_raw_ticks(
+                            raw_ticks=raw_historical,
+                            symbol=self.symbol,
+                            provenance="RECOVERED_HISTORICAL_MT5",
+                            cutoff_realtime_msc=self.boot_time_msc
+                        )
+                        if rec_ticks:
+                            chunk_size = 10000
+                            for i in range(0, len(rec_ticks), chunk_size):
+                                chunk = rec_ticks[i:i + chunk_size]
+                                self.spool.append_ticks_batch(chunk, stream_key=self.symbol)
+                            recovery_result["recovered_count"] = len(rec_ticks)
+                            recovery_result["status"] = "RECOVERED_NEW_SESSION_ON_STARTUP"
+                else:
+                    logger.info(f"Boot pré-abertura (antes das 09:00 BRT). Estado: PRE_MARKET_STANDBY.")
+                    recovery_result["status"] = "PRE_MARKET_STANDBY"
+            else:
+                # Checkpoint pertence à mesma sessão: avaliar gap contextual intra-dia
+                logger.info(f"Retomando coleta intra-dia a partir do checkpoint {ckp.last_captured_msc}...")
+                res = self.gap_manager.evaluate_and_recover(
+                    symbol=self.symbol,
+                    last_seen_msc=ckp.last_captured_msc,
+                    current_time_msc=now_msc,
+                    is_connected=self.reader.is_connected()
+                )
+                if res.get("recovered_ticks"):
+                    rec_ticks = res["recovered_ticks"]
+                    chunk_size = 10000
+                    for i in range(0, len(rec_ticks), chunk_size):
+                        chunk = rec_ticks[i:i + chunk_size]
+                        self.spool.append_ticks_batch(chunk, stream_key=self.symbol)
+                    recovery_result["recovered_count"] = len(rec_ticks)
+                    recovery_result["status"] = "RECOVERED_ON_STARTUP"
+
 
         # Sincronizar candles M2 fechados
         try:
