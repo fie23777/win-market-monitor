@@ -2,9 +2,17 @@ import sqlite3
 import json
 from pathlib import Path
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from typing import List, Optional
 from src.domain.models import TradeTick, M2CandleClosed, Checkpoints
 from src.connection.mt5_time_normalizer import MT5TimeNormalizer
+
+@dataclass(frozen=True)
+class BatchInsertionResult:
+    attempted_count: int
+    inserted_count: int
+    duplicate_count: int
+    failed_count: int = 0
 
 class DurableSpool:
     """
@@ -80,20 +88,29 @@ class DurableSpool:
             except Exception:
                 pass  # Coluna já existe
 
-    def append_ticks_batch(self, ticks: List[TradeTick], stream_key: str = "WINZ26") -> int:
+    def append_ticks_batch_detailed(
+        self,
+        ticks: List[TradeTick],
+        stream_key: str = "WINZ26",
+        checkpoint_msc: Optional[int] = None
+    ) -> BatchInsertionResult:
         """
-        Persiste atômica e duravelmente um lote de ticks no buffer local e avança o checkpoint de captura.
+        Persiste atômica e duravelmente um lote de ticks no buffer local, retornando
+        métricas exatas de inserção e duplicatas.
         """
         if not ticks:
-            return 0
+            return BatchInsertionResult(0, 0, 0, 0)
 
         now_iso = datetime.now(timezone.utc).isoformat()
         max_msc = max(t.time_msc for t in ticks)
+        target_ckp = checkpoint_msc if checkpoint_msc is not None else max_msc
 
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE;")
             
+            c_before = cursor.execute("SELECT count(*) FROM spool_ticks;").fetchone()[0]
+
             records = [
                 (
                     t.tick_fingerprint, t.symbol, t.time_msc, t.price, t.volume_real,
@@ -108,17 +125,60 @@ class DurableSpool:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?);
             """, records)
 
-            # Atualizar checkpoint de captura local
+            c_after = cursor.execute("SELECT count(*) FROM spool_ticks;").fetchone()[0]
+            inserted_count = c_after - c_before
+            attempted_count = len(records)
+            duplicate_count = attempted_count - inserted_count
+
+            # Atualizar checkpoint de captura local por cobertura comprovada
+            if target_ckp > 0:
+                cursor.execute("""
+                INSERT INTO checkpoints_two_stage (stream_key, last_captured_msc, last_replicated_msc, updated_at_utc)
+                VALUES (?, ?, 0, ?)
+                ON CONFLICT(stream_key) DO UPDATE SET
+                    last_captured_msc = MAX(last_captured_msc, excluded.last_captured_msc),
+                    updated_at_utc = excluded.updated_at_utc;
+                """, (stream_key, target_ckp, now_iso))
+
+            conn.commit()
+            return BatchInsertionResult(
+                attempted_count=attempted_count,
+                inserted_count=inserted_count,
+                duplicate_count=duplicate_count,
+                failed_count=0
+            )
+
+    def append_ticks_batch(
+        self,
+        ticks: List[TradeTick],
+        stream_key: str = "WINZ26",
+        checkpoint_msc: Optional[int] = None
+    ) -> int:
+        """
+        Persiste atômica e duravelmente um lote de ticks no buffer local e avança o checkpoint de captura.
+        Retorna a quantidade de registros novos efetivamente inseridos.
+        """
+        res = self.append_ticks_batch_detailed(ticks, stream_key=stream_key, checkpoint_msc=checkpoint_msc)
+        return res.inserted_count
+
+    def update_captured_checkpoint(self, safe_msc: int, stream_key: str = "WINZ26") -> None:
+        """
+        Avança last_captured_msc de forma estritamente monotônica por cobertura temporal comprovada,
+        mesmo quando um lote percorrido for 100% de duplicatas já persistidas.
+        """
+        if safe_msc <= 0:
+            return
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
             cursor.execute("""
             INSERT INTO checkpoints_two_stage (stream_key, last_captured_msc, last_replicated_msc, updated_at_utc)
             VALUES (?, ?, 0, ?)
             ON CONFLICT(stream_key) DO UPDATE SET
                 last_captured_msc = MAX(last_captured_msc, excluded.last_captured_msc),
                 updated_at_utc = excluded.updated_at_utc;
-            """, (stream_key, max_msc, now_iso))
-
+            """, (stream_key, safe_msc, now_iso))
             conn.commit()
-            return len(records)
 
     def append_candle_m2(self, candle: M2CandleClosed) -> bool:
         """Persiste duravelmente um candle M2 fechado no spool local."""

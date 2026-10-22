@@ -12,7 +12,7 @@ except Exception:
 from src.config import AppConfig
 from src.domain.models import Checkpoints, M2CandleClosed
 from src.connection.mt5_time_normalizer import MT5TimeNormalizer
-from src.connection.mt5_reader import MT5ReadOnlyReader
+from src.connection.mt5_reader import MT5ReadOnlyReader, MT5QueryStatus, MT5QueryResult
 from src.buffer.durable_spool import DurableSpool
 from src.reconciliation.tick_reconciler import TickReconciler
 from src.reconciliation.periodic_reconciler import PeriodicHistoricalReconciler
@@ -70,6 +70,12 @@ class MarketCollectorEngine:
         )
         self._is_running = False
         self.boot_time_msc: int = 0
+        self._adaptive_batch_size: int = self.config.buffer.batch_size
+        self._cursor_stagnation_count: int = 0
+        self._last_cursor_from_msc: int = 0
+        self._last_batch_saturated: bool = False
+        self._stagnation_limit_cycles: int = getattr(self.config.collector, "stagnation_limit_cycles", 5)
+        self._max_batch_size: int = getattr(self.config.collector, "max_batch_size", 5000)
 
 
     def _get_session_start_msc(self, target_date: Optional[date] = None) -> int:
@@ -307,33 +313,114 @@ class MarketCollectorEngine:
     def capture_step(self, raw_ticks: Optional[list] = None) -> int:
         """
         Estágio 1: Captura e grava duravelmente no buffer local SQLite WAL.
-        Avança last_captured_msc.
-        Diferencia ausência legítima de negócios de desconexão do MT5.
+        Avança last_captured_msc estritamente por cobertura temporal comprovada.
+        Diferencia ausência legítima de negócios de erros e desconexão do MT5.
+        Trata lotes densos com recuo preventivo da fronteira saturada.
         """
+        is_capacity_saturated = False
+        ckp = self.spool.get_checkpoints(self.symbol)
+        from_msc = 0
+
         if raw_ticks is None:
-            # Verificar conectividade ativa do MT5 antes da consulta
+            # 1. Verificar conectividade ativa do MT5 antes da consulta
             if not self.reader.is_connected():
                 logger.warning(f"Desconexão do terminal MT5 detectada durante captura de {self.symbol}.")
                 reconnected = self._attempt_mt5_reconnect()
                 if not reconnected:
                     return 0
 
-            ckp = self.spool.get_checkpoints(self.symbol)
             session_start = self._get_session_start_msc()
             lookback_ms = getattr(self.config.collector, "lookback_ms", 2000)
             
             if ckp.last_captured_msc > 0:
-                # Lookback adaptativo para capturar negócios que sofreram jitter de rede
-                from_msc = max(session_start, ckp.last_captured_msc - lookback_ms)
+                if self._last_batch_saturated:
+                    # Durante drenagem de lote denso/saturado, parte diretamente do checkpoint seguro
+                    # comprovado para evitar repetição infinita de ticks do lookback
+                    from_msc = ckp.last_captured_msc
+                else:
+                    from_msc = max(session_start, ckp.last_captured_msc - lookback_ms)
             else:
                 from_msc = session_start
 
-            raw_ticks = self.reader.fetch_ticks_from(self.symbol, from_msc, count=self.config.buffer.batch_size)
+            # Rastreamento de estagnação de cursor
+            if from_msc == self._last_cursor_from_msc:
+                self._cursor_stagnation_count += 1
+                if self._cursor_stagnation_count >= self._stagnation_limit_cycles:
+                    logger.warning(
+                        f"TELEMETRIA DE ESTAGNAÇÃO: Cursor em {from_msc} estagnado há "
+                        f"{self._cursor_stagnation_count} ciclos consecutivas."
+                    )
+            else:
+                self._last_cursor_from_msc = from_msc
+                self._cursor_stagnation_count = 0
+
+            # 2. Consultar MT5 com contrato formal
+            query_res = None
+            if hasattr(self.reader, "query_ticks_from"):
+                query_res = self.reader.query_ticks_from(
+                    self.symbol, from_msc, count=self._adaptive_batch_size
+                )
+
+            if isinstance(query_res, MT5QueryResult):
+                if query_res.status == MT5QueryStatus.DISCONNECTED:
+                    self._attempt_mt5_reconnect()
+                    return 0
+
+                if query_res.status in (MT5QueryStatus.MT5_QUERY_ERROR, MT5QueryStatus.INCONCLUSIVE):
+                    logger.warning(
+                        f"Consulta MT5 retornou status {query_res.status}: code={query_res.error_code}, "
+                        f"msg={query_res.error_message}. Checkpoint mantido sem avanço."
+                    )
+                    return 0
+
+                if query_res.status == MT5QueryStatus.SUCCESS_EMPTY_VERIFIED:
+                    # Intervalo comprovadamente sem novos negócios no broker
+                    return 0
+
+                raw_ticks = query_res.ticks
+                is_capacity_saturated = query_res.is_capacity_saturated
+            else:
+                # Fallback para mocks legados ou implementações que expõem apenas fetch_ticks_from
+                fetched = self.reader.fetch_ticks_from(
+                    self.symbol, from_msc, count=self._adaptive_batch_size
+                )
+                if isinstance(fetched, list):
+                    raw_ticks = fetched
+                    is_capacity_saturated = (len(raw_ticks) >= self._adaptive_batch_size)
+                else:
+                    raw_ticks = []
+        else:
+            # Em chamadas diretas com ticks pré-definidos (testes / simulações)
+            is_capacity_saturated = (len(raw_ticks) >= self._adaptive_batch_size)
 
         if not raw_ticks:
             return 0
 
-        # Reconciliar por multiplicidade de ocorrências e filtrar negócios
+        # 3. Determinar a fronteira de cobertura temporal comprovada (safe_msc)
+        max_batch_msc = max(t["time_msc"] for t in raw_ticks)
+
+        if not is_capacity_saturated:
+            # Lote NÃO atingiu capacidade: todo o intervalo até max_batch_msc foi entregue
+            safe_msc = max_batch_msc
+            self._adaptive_batch_size = self.config.buffer.batch_size
+            self._cursor_stagnation_count = 0
+        else:
+            # Lote atingiu capacidade: risco de truncamento no milissegundo de fronteira!
+            sub_mscs = [t["time_msc"] for t in raw_ticks if t["time_msc"] < max_batch_msc]
+            if sub_mscs:
+                # Lote multi-temporal: a fronteira segura é o maior milissegundo estritamente anterior
+                safe_msc = max(sub_mscs)
+            else:
+                # Lote mono-temporal ultra-denso (todos os ticks no mesmo milissegundo)
+                safe_msc = ckp.last_captured_msc
+                self._adaptive_batch_size = min(self._adaptive_batch_size * 2, self._max_batch_size)
+                self._cursor_stagnation_count += 1
+                logger.info(
+                    f"Milissegundo ultra-denso em {max_batch_msc} ({len(raw_ticks)} ticks). "
+                    f"Expandindo batch_size para {self._adaptive_batch_size}."
+                )
+
+        # 4. Reconciliar negócios e filtrar atualizações de book
         cutoff = self.boot_time_msc if self.boot_time_msc > 0 else None
         reconciled = self.reconciler.reconcile_raw_ticks(
             raw_ticks=raw_ticks,
@@ -342,11 +429,17 @@ class MarketCollectorEngine:
             cutoff_realtime_msc=cutoff
         )
 
-        if not reconciled:
-            return 0
+        inserted = 0
+        if reconciled:
+            # Gravar no SQLite WAL e avançar checkpoint com safe_msc
+            inserted = self.spool.append_ticks_batch(
+                reconciled, stream_key=self.symbol, checkpoint_msc=safe_msc
+            )
+        elif safe_msc > ckp.last_captured_msc:
+            # Todos os ticks eram duplicatas já persistidas, mas a cobertura temporal foi comprovada!
+            self.spool.update_captured_checkpoint(safe_msc, stream_key=self.symbol)
 
-        # Gravar no SQLite WAL e avançar last_captured_msc
-        inserted = self.spool.append_ticks_batch(reconciled, stream_key=self.symbol)
+        self._last_batch_saturated = is_capacity_saturated
         return inserted
 
     def replicate_pending_to_postgres(self, batch_size: int = 1000) -> int:
