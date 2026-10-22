@@ -127,13 +127,29 @@ def test_dense_boundary_multiple_ticks_same_millisecond_safe_watermark(tmp_path)
     )
     
     inserted = engine.capture_step()
-    assert inserted == 1000
+    # H002 B.1.1: Persistir apenas a porção comprovadamente completa (950 ticks)
+    # Os 50 ticks do milissegundo de fronteira saturada são retidos para reprocessamento limpo
+    assert inserted == 950
     
     ckp = spool.get_checkpoints("WINZ26")
     # O checkpoint seguro NÃO pode ser 1792573201000 (pois este foi cortado pela capacidade),
     # deve ser o maior milissegundo anterior à fronteira: 1792573200949!
     assert ckp.last_captured_msc == 1792573200949
     assert ckp.last_captured_msc < 1792573201000
+
+    # Ciclo 2: Próxima consulta traz os 50 ticks restantes do milissegundo 1792573201000 (sem saturação)
+    remaining_ticks = raw_ticks[950:]
+    mock_reader.query_ticks_from.return_value = MT5QueryResult(
+        status=MT5QueryStatus.SUCCESS_WITH_DATA,
+        ticks=remaining_ticks,
+        requested_from=1792573200950,
+        requested_to_or_count=1000,
+        is_capacity_saturated=False
+    )
+    inserted_2 = engine.capture_step()
+    assert inserted_2 == 50
+    ckp_2 = spool.get_checkpoints("WINZ26")
+    assert ckp_2.last_captured_msc == 1792573201000
 
 def test_checkpoint_advances_by_proven_coverage_even_with_existing_duplicates(tmp_path):
     """

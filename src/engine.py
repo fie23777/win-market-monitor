@@ -72,11 +72,22 @@ class MarketCollectorEngine:
         self.boot_time_msc: int = 0
         self._adaptive_batch_size: int = self.config.buffer.batch_size
         self._cursor_stagnation_count: int = 0
+        self._density_stagnation_count: int = 0
         self._last_cursor_from_msc: int = 0
         self._last_batch_saturated: bool = False
+        self._last_safe_msc_advanced: bool = False
         self._stagnation_limit_cycles: int = getattr(self.config.collector, "stagnation_limit_cycles", 5)
         self._max_batch_size: int = getattr(self.config.collector, "max_batch_size", 5000)
 
+        # Estado operacional e telemetria acionável
+        self.operational_status: str = "HEALTHY"
+        self.has_critical_stagnation: bool = False
+        self.last_stagnation_error: Optional[str] = None
+        self.inconclusive_intervals: list = []
+
+    def is_healthy(self) -> bool:
+        """Indica se o coletor está em estado operacional saudável ou sob contenção fail-closed."""
+        return self.operational_status == "HEALTHY" and not self.has_critical_stagnation
 
     def _get_session_start_msc(self, target_date: Optional[date] = None) -> int:
         """
@@ -317,6 +328,12 @@ class MarketCollectorEngine:
         Diferencia ausência legítima de negócios de erros e desconexão do MT5.
         Trata lotes densos com recuo preventivo da fronteira saturada.
         """
+        if self.has_critical_stagnation:
+            logger.error(
+                f"Captura suspensa em fail-closed para {self.symbol}: {self.last_stagnation_error}"
+            )
+            return 0
+
         is_capacity_saturated = False
         ckp = self.spool.get_checkpoints(self.symbol)
         from_msc = 0
@@ -334,9 +351,13 @@ class MarketCollectorEngine:
             
             if ckp.last_captured_msc > 0:
                 if self._last_batch_saturated:
-                    # Durante drenagem de lote denso/saturado, parte diretamente do checkpoint seguro
-                    # comprovado para evitar repetição infinita de ticks do lookback
-                    from_msc = ckp.last_captured_msc
+                    # Durante drenagem de lote saturado: se o lote anterior avançou com fronteira comprovada,
+                    # avança para o próximo ms (+1) para não reprocessar ticks já fechados.
+                    # Se estagnou (mono-temporal), mantém ckp.last_captured_msc para expandir capacidade.
+                    if self._last_safe_msc_advanced:
+                        from_msc = ckp.last_captured_msc + 1
+                    else:
+                        from_msc = ckp.last_captured_msc
                 else:
                     from_msc = max(session_start, ckp.last_captured_msc - lookback_ms)
             else:
@@ -348,7 +369,7 @@ class MarketCollectorEngine:
                 if self._cursor_stagnation_count >= self._stagnation_limit_cycles:
                     logger.warning(
                         f"TELEMETRIA DE ESTAGNAÇÃO: Cursor em {from_msc} estagnado há "
-                        f"{self._cursor_stagnation_count} ciclos consecutivas."
+                        f"{self._cursor_stagnation_count} ciclos consecutivos."
                     )
             else:
                 self._last_cursor_from_msc = from_msc
@@ -398,45 +419,90 @@ class MarketCollectorEngine:
 
         # 3. Determinar a fronteira de cobertura temporal comprovada (safe_msc)
         max_batch_msc = max(t["time_msc"] for t in raw_ticks)
+        ticks_to_persist = []
 
         if not is_capacity_saturated:
             # Lote NÃO atingiu capacidade: todo o intervalo até max_batch_msc foi entregue
             safe_msc = max_batch_msc
+            ticks_to_persist = raw_ticks
             self._adaptive_batch_size = self.config.buffer.batch_size
             self._cursor_stagnation_count = 0
+            self._density_stagnation_count = 0
+            self._last_safe_msc_advanced = (safe_msc > ckp.last_captured_msc)
         else:
             # Lote atingiu capacidade: risco de truncamento no milissegundo de fronteira!
             sub_mscs = [t["time_msc"] for t in raw_ticks if t["time_msc"] < max_batch_msc]
             if sub_mscs:
                 # Lote multi-temporal: a fronteira segura é o maior milissegundo estritamente anterior
                 safe_msc = max(sub_mscs)
+                # CRÍTICO (H002 B.1.1): Persistir estritamente os ticks comprovadamente completos (time_msc <= safe_msc).
+                # O milissegundo final max_batch_msc é retido para ser consultado e reconciliado por inteiro no próximo ciclo.
+                ticks_to_persist = [t for t in raw_ticks if t["time_msc"] <= safe_msc]
+                self._last_safe_msc_advanced = (safe_msc > ckp.last_captured_msc)
+                self._cursor_stagnation_count = 0
+                self._density_stagnation_count = 0
             else:
                 # Lote mono-temporal ultra-denso (todos os ticks no mesmo milissegundo)
                 safe_msc = ckp.last_captured_msc
-                self._adaptive_batch_size = min(self._adaptive_batch_size * 2, self._max_batch_size)
-                self._cursor_stagnation_count += 1
-                logger.info(
-                    f"Milissegundo ultra-denso em {max_batch_msc} ({len(raw_ticks)} ticks). "
-                    f"Expandindo batch_size para {self._adaptive_batch_size}."
-                )
+                ticks_to_persist = []  # NENHUM registro da fronteira não comprovada é persistido!
+                self._last_safe_msc_advanced = False
 
-        # 4. Reconciliar negócios e filtrar atualizações de book
-        cutoff = self.boot_time_msc if self.boot_time_msc > 0 else None
-        reconciled = self.reconciler.reconcile_raw_ticks(
-            raw_ticks=raw_ticks,
-            symbol=self.symbol,
-            provenance="REALTIME_STREAM",
-            cutoff_realtime_msc=cutoff
-        )
+                if len(raw_ticks) < self._max_batch_size:
+                    self._adaptive_batch_size = min(self._adaptive_batch_size * 2, self._max_batch_size)
+                    self._cursor_stagnation_count += 1
+                    logger.info(
+                        f"Milissegundo ultra-denso em {max_batch_msc} ({len(raw_ticks)} ticks). "
+                        f"Expandindo batch_size para {self._adaptive_batch_size}."
+                    )
+                else:
+                    # Densidade mono-temporal atingiu ou excedeu o limite máximo seguro (ex: 5000)!
+                    # Registrar intervalo inconclusivo e acionar proteção fail-closed acionável
+                    self._density_stagnation_count += 1
+                    inconclusive_event = {
+                        "time_msc": max_batch_msc,
+                        "tick_count": len(raw_ticks),
+                        "max_batch_size": self._max_batch_size,
+                        "cursor_from_msc": from_msc,
+                        "stagnation_count": self._density_stagnation_count,
+                        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                        "reason": "MONO_TEMPORAL_DENSITY_EXCEEDED_MAX_BATCH"
+                    }
+                    self.inconclusive_intervals.append(inconclusive_event)
+                    logger.warning(
+                        f"INTERVALO INCONCLUSIVO REGISTRADO: Densidade em {max_batch_msc} ({len(raw_ticks)} ticks) "
+                        f"excede capacidade máxima ({self._max_batch_size}). Checkpoint travado em {safe_msc}."
+                    )
 
+                    if self._density_stagnation_count >= self._stagnation_limit_cycles:
+                        self.operational_status = "CRITICAL_STAGNATION_LIMIT_EXCEEDED"
+                        self.has_critical_stagnation = True
+                        self.last_stagnation_error = (
+                            f"Densidade extrema em {max_batch_msc} ({len(raw_ticks)} ticks) "
+                            f"excedeu limite seguro ({self._max_batch_size} ticks) por {self._density_stagnation_count} ciclos consecutivos. "
+                            f"Fail-closed ativado para impedir perda silenciosa de dados."
+                        )
+                        logger.critical(f"ESTADO DE ERRO OPERACIONAL ACIONÁVEL: {self.last_stagnation_error}")
+
+        # 4. Reconciliar negócios e filtrar atualizações de book apenas dos registros aprovados
         inserted = 0
-        if reconciled:
-            # Gravar no SQLite WAL e avançar checkpoint com safe_msc
-            inserted = self.spool.append_ticks_batch(
-                reconciled, stream_key=self.symbol, checkpoint_msc=safe_msc
+        if ticks_to_persist:
+            cutoff = self.boot_time_msc if self.boot_time_msc > 0 else None
+            reconciled = self.reconciler.reconcile_raw_ticks(
+                raw_ticks=ticks_to_persist,
+                symbol=self.symbol,
+                provenance="REALTIME_STREAM",
+                cutoff_realtime_msc=cutoff
             )
+
+            if reconciled:
+                # Gravar no SQLite WAL e avançar checkpoint com safe_msc
+                inserted = self.spool.append_ticks_batch(
+                    reconciled, stream_key=self.symbol, checkpoint_msc=safe_msc
+                )
+            elif safe_msc > ckp.last_captured_msc:
+                # Todos os ticks eram duplicatas já persistidas, mas a cobertura temporal foi comprovada!
+                self.spool.update_captured_checkpoint(safe_msc, stream_key=self.symbol)
         elif safe_msc > ckp.last_captured_msc:
-            # Todos os ticks eram duplicatas já persistidas, mas a cobertura temporal foi comprovada!
             self.spool.update_captured_checkpoint(safe_msc, stream_key=self.symbol)
 
         self._last_batch_saturated = is_capacity_saturated

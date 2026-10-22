@@ -109,7 +109,7 @@ class DurableSpool:
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE;")
             
-            c_before = cursor.execute("SELECT count(*) FROM spool_ticks;").fetchone()[0]
+            changes_before = conn.total_changes
 
             records = [
                 (
@@ -125,8 +125,8 @@ class DurableSpool:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?);
             """, records)
 
-            c_after = cursor.execute("SELECT count(*) FROM spool_ticks;").fetchone()[0]
-            inserted_count = c_after - c_before
+            # Contabilização transacional O(1) via connection total_changes sem escanear a tabela
+            inserted_count = conn.total_changes - changes_before
             attempted_count = len(records)
             duplicate_count = attempted_count - inserted_count
 
