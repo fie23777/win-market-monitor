@@ -79,15 +79,49 @@ class MarketCollectorEngine:
         self._stagnation_limit_cycles: int = getattr(self.config.collector, "stagnation_limit_cycles", 5)
         self._max_batch_size: int = getattr(self.config.collector, "max_batch_size", 5000)
 
-        # Estado operacional e telemetria acionável
+        # Estado operacional e telemetria acionável persistida duravelmente
         self.operational_status: str = "HEALTHY"
         self.has_critical_stagnation: bool = False
         self.last_stagnation_error: Optional[str] = None
         self.inconclusive_intervals: list = []
 
+        # Restaurar estado operacional persistido no buffer SQLite WAL
+        if hasattr(self.spool, "get_active_operational_alerts"):
+            try:
+                active_alerts = self.spool.get_active_operational_alerts(self.symbol)
+                for alert in active_alerts:
+                    if alert["alert_type"] == "CRITICAL_STAGNATION_LIMIT_EXCEEDED":
+                        self.operational_status = "CRITICAL_STAGNATION_LIMIT_EXCEEDED"
+                        self.has_critical_stagnation = True
+                        self.last_stagnation_error = alert["details"]
+                        logger.critical(
+                            f"ALERTA OPERACIONAL RESTAURADO DO SPOOL: {self.last_stagnation_error} "
+                            "(Captura inicializada sob contenção fail-closed)."
+                        )
+                        break
+            except Exception as e:
+                logger.warning(f"Aviso ao consultar alertas operacionais ativos: {e}")
+
+        if hasattr(self.spool, "get_inconclusive_intervals"):
+            try:
+                self.inconclusive_intervals = self.spool.get_inconclusive_intervals(self.symbol, limit=100)
+            except Exception as e:
+                logger.warning(f"Aviso ao consultar histórico de intervalos inconclusivos: {e}")
+
     def is_healthy(self) -> bool:
         """Indica se o coletor está em estado operacional saudável ou sob contenção fail-closed."""
         return self.operational_status == "HEALTHY" and not self.has_critical_stagnation
+
+    def resolve_stagnation_alert(self) -> None:
+        """Resolve o alerta de estagnação crítica e reabilita o coletor para o modo HEALTHY."""
+        if hasattr(self.spool, "resolve_operational_alerts"):
+            self.spool.resolve_operational_alerts(self.symbol, "CRITICAL_STAGNATION_LIMIT_EXCEEDED")
+        self.operational_status = "HEALTHY"
+        self.has_critical_stagnation = False
+        self.last_stagnation_error = None
+        self._density_stagnation_count = 0
+        self._cursor_stagnation_count = 0
+        logger.info(f"Alerta operacional de estagnação para {self.symbol} resolvido com sucesso.")
 
     def _get_session_start_msc(self, target_date: Optional[date] = None) -> int:
         """
@@ -468,6 +502,14 @@ class MarketCollectorEngine:
                         "reason": "MONO_TEMPORAL_DENSITY_EXCEEDED_MAX_BATCH"
                     }
                     self.inconclusive_intervals.append(inconclusive_event)
+                    if hasattr(self.spool, "record_inconclusive_interval"):
+                        self.spool.record_inconclusive_interval(
+                            stream_key=self.symbol,
+                            time_msc=max_batch_msc,
+                            cursor_from_msc=from_msc,
+                            tick_count=len(raw_ticks),
+                            reason="MONO_TEMPORAL_DENSITY_EXCEEDED_MAX_BATCH"
+                        )
                     logger.warning(
                         f"INTERVALO INCONCLUSIVO REGISTRADO: Densidade em {max_batch_msc} ({len(raw_ticks)} ticks) "
                         f"excede capacidade máxima ({self._max_batch_size}). Checkpoint travado em {safe_msc}."
@@ -481,6 +523,13 @@ class MarketCollectorEngine:
                             f"excedeu limite seguro ({self._max_batch_size} ticks) por {self._density_stagnation_count} ciclos consecutivos. "
                             f"Fail-closed ativado para impedir perda silenciosa de dados."
                         )
+                        if hasattr(self.spool, "record_operational_alert"):
+                            self.spool.record_operational_alert(
+                                stream_key=self.symbol,
+                                alert_type="CRITICAL_STAGNATION_LIMIT_EXCEEDED",
+                                details=self.last_stagnation_error,
+                                time_msc=max_batch_msc
+                            )
                         logger.critical(f"ESTADO DE ERRO OPERACIONAL ACIONÁVEL: {self.last_stagnation_error}")
 
         # 4. Reconciliar negócios e filtrar atualizações de book apenas dos registros aprovados
@@ -527,7 +576,12 @@ class MarketCollectorEngine:
             logger.warning(f"PostgreSQL temporariamente indisponível ({e}). Itens permanecem no spool local durável.")
             return 0
 
-    def periodic_reconcile_step(self, now_server_msc: Optional[int] = None, session_start_msc: Optional[int] = None) -> Dict[str, Any]:
+    def periodic_reconcile_step(
+        self,
+        now_server_msc: Optional[int] = None,
+        session_start_msc: Optional[int] = None,
+        auto_replicate: bool = False
+    ) -> Dict[str, Any]:
         """
         Executa uma passada do reconciliador histórico periódico.
         Varre retrospectivamente negócios disponibilizados com atraso (atraso > lookback_ms)
@@ -542,10 +596,11 @@ class MarketCollectorEngine:
             ref_date = ref_dt.astimezone(self.time_normalizer.market_tz).date()
             session_start_msc = self._get_session_start_msc(ref_date)
 
+        replicate_fn = self.replicate_pending_to_postgres if auto_replicate else None
         return self.periodic_reconciler.reconcile_cycle(
             now_server_msc=now_server_msc,
             session_start_msc=session_start_msc,
-            replicate_fn=self.replicate_pending_to_postgres
+            replicate_fn=replicate_fn
         )
 
 

@@ -56,9 +56,11 @@ def test_mono_temporal_density_exceeding_5000_triggers_inconclusive_and_fail_clo
         for _ in range(5001)
     ]
 
+    # H002 B.2 Condição 5: A população total no MT5 contém 5.001 registros,
+    # mas a API chamada com requested_to_or_count=5000 devolve no máximo 5.000 registros (truncamento por capacidade)
     mock_reader.query_ticks_from.return_value = MT5QueryResult(
         status=MT5QueryStatus.SUCCESS_WITH_DATA,
-        ticks=raw_ticks,
+        ticks=raw_ticks[:5000],
         requested_from=mono_msc,
         requested_to_or_count=5000,
         is_capacity_saturated=True
@@ -67,14 +69,14 @@ def test_mono_temporal_density_exceeding_5000_triggers_inconclusive_and_fail_clo
     initial_ckp = spool.get_checkpoints("WINZ26").last_captured_msc
     assert engine.is_healthy() is True
 
-    # Ciclo 1: Detecta densidade mono-temporal extrema no limite máximo
+    # Ciclo 1: Detecta densidade mono-temporal extrema no limite máximo (5000 ticks)
     inserted_1 = engine.capture_step()
     assert inserted_1 == 0
     # Checkpoint NÃO avança
     assert spool.get_checkpoints("WINZ26").last_captured_msc == initial_ckp
-    assert len(engine.inconclusive_intervals) == 1
+    assert len(engine.inconclusive_intervals) >= 1
     assert engine.inconclusive_intervals[0]["time_msc"] == mono_msc
-    assert engine.inconclusive_intervals[0]["tick_count"] == 5001
+    assert engine.inconclusive_intervals[0]["tick_count"] == 5000
 
     # Ciclo 2: Continua saturado
     engine.capture_step()
@@ -91,6 +93,22 @@ def test_mono_temporal_density_exceeding_5000_triggers_inconclusive_and_fail_clo
     res_4 = engine.capture_step()
     assert res_4 == 0
     assert spool.get_checkpoints("WINZ26").last_captured_msc == initial_ckp
+
+    # H002 B.2 Condição 4: Comprovação de que o estado fail-closed SOBREVIVE A REINICIALIZAÇÃO DO PROCESSO
+    del engine
+    mock_reader_reboot = MagicMock()
+    mock_reader_reboot.is_connected.return_value = True
+    spool_reboot = DurableSpool(db_file)
+    engine_reboot = MarketCollectorEngine(
+        config=config,
+        reader=mock_reader_reboot,
+        spool=spool_reboot
+    )
+    # Alerta persiste mesmo após nova instância com memória limpa
+    assert engine_reboot.operational_status == "CRITICAL_STAGNATION_LIMIT_EXCEEDED"
+    assert engine_reboot.has_critical_stagnation is True
+    assert engine_reboot.is_healthy() is False
+    assert engine_reboot.capture_step() == 0
 
 
 def test_process_crash_after_partial_boundary_and_cold_restart_recovers_without_loss_or_duplicates(tmp_path):

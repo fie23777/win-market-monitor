@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from datetime import datetime, timezone
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from src.domain.models import TradeTick, M2CandleClosed, Checkpoints
 from src.connection.mt5_time_normalizer import MT5TimeNormalizer
 
@@ -87,6 +87,30 @@ class DurableSpool:
                 conn.execute("ALTER TABLE checkpoints_two_stage ADD COLUMN watermark_complete_msc INTEGER NOT NULL DEFAULT 0;")
             except Exception:
                 pass  # Coluna já existe
+
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS spool_operational_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                stream_key TEXT NOT NULL,
+                alert_type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'ACTIVE',
+                details TEXT NOT NULL,
+                time_msc INTEGER,
+                created_at_utc TEXT NOT NULL,
+                resolved_at_utc TEXT
+            );
+            """)
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS spool_inconclusive_intervals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                stream_key TEXT NOT NULL,
+                time_msc INTEGER NOT NULL,
+                cursor_from_msc INTEGER NOT NULL,
+                tick_count INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_at_utc TEXT NOT NULL
+            );
+            """)
 
     def append_ticks_batch_detailed(
         self,
@@ -365,5 +389,88 @@ class DurableSpool:
             """, (symbol,))
             row = cursor.fetchone()
             return row["min_msc"] if row and row["min_msc"] is not None else None
+
+    def record_operational_alert(
+        self,
+        stream_key: str,
+        alert_type: str,
+        details: str,
+        time_msc: Optional[int] = None
+    ) -> int:
+        """Persiste um alerta operacional crítico no buffer local."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            INSERT INTO spool_operational_alerts (
+                stream_key, alert_type, status, details, time_msc, created_at_utc
+            ) VALUES (?, ?, 'ACTIVE', ?, ?, ?);
+            """, (stream_key, alert_type, details, time_msc, now_iso))
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_active_operational_alerts(self, stream_key: str = "WINZ26") -> List[Dict[str, Any]]:
+        """Retorna todos os alertas operacionais que permanecem ativos."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            SELECT id, stream_key, alert_type, status, details, time_msc, created_at_utc
+            FROM spool_operational_alerts
+            WHERE stream_key = ? AND status = 'ACTIVE'
+            ORDER BY id ASC;
+            """, (stream_key,))
+            return [dict(r) for r in cursor.fetchall()]
+
+    def resolve_operational_alerts(self, stream_key: str = "WINZ26", alert_type: Optional[str] = None) -> None:
+        """Marca alertas operacionais como resolvidos."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if alert_type:
+                cursor.execute("""
+                UPDATE spool_operational_alerts
+                SET status = 'RESOLVED', resolved_at_utc = ?
+                WHERE stream_key = ? AND alert_type = ? AND status = 'ACTIVE';
+                """, (now_iso, stream_key, alert_type))
+            else:
+                cursor.execute("""
+                UPDATE spool_operational_alerts
+                SET status = 'RESOLVED', resolved_at_utc = ?
+                WHERE stream_key = ? AND status = 'ACTIVE';
+                """, (now_iso, stream_key))
+            conn.commit()
+
+    def record_inconclusive_interval(
+        self,
+        stream_key: str,
+        time_msc: int,
+        cursor_from_msc: int,
+        tick_count: int,
+        reason: str
+    ) -> None:
+        """Persiste um intervalo inconclusivo no buffer local SQLite."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            INSERT INTO spool_inconclusive_intervals (
+                stream_key, time_msc, cursor_from_msc, tick_count, reason, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?);
+            """, (stream_key, time_msc, cursor_from_msc, tick_count, reason, now_iso))
+            conn.commit()
+
+    def get_inconclusive_intervals(self, stream_key: str = "WINZ26", limit: int = 100) -> List[Dict[str, Any]]:
+        """Retorna histórico de intervalos inconclusivos registrados."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            SELECT id, stream_key, time_msc, cursor_from_msc, tick_count, reason, created_at_utc
+            FROM spool_inconclusive_intervals
+            WHERE stream_key = ?
+            ORDER BY id DESC
+            LIMIT ?;
+            """, (stream_key, limit))
+            return [dict(r) for r in cursor.fetchall()]
+
 
 
