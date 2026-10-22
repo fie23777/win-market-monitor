@@ -1,0 +1,50 @@
+{
+  "report_time_brt": "2026-10-19 11:39:42",
+  "watermark_msc": 1792409979901,
+  "watermark_brt": "11:39:39.901",
+  "pid": 3016,
+  "pid_active": true,
+  "mt5_connected": true,
+  "cpu_percent": 0.0,
+  "ram_rss_mb": 68.1,
+  "counts": {
+    "sqlite_ticks": 1047707,
+    "postgres_total": 1047707,
+    "postgres_historical": 759845,
+    "postgres_realtime": 287862,
+    "historical_plus_realtime": 1047707,
+    "discrepancy": 0,
+    "backlog_pending": 15
+  },
+  "hashes": {
+    "sqlite_sha256": "203dcf916dd78e142d8e91197fdb5fe6d6b1e4309b20cae3549616f7f20f6be1",
+    "postgres_sha256": "203dcf916dd78e142d8e91197fdb5fe6d6b1e4309b20cae3549616f7f20f6be1",
+    "match": true
+  },
+  "capture_latency": {
+    "mean_ms": 127.21,
+    "p50_ms": 96.17,
+    "p95_ms": 191.26,
+    "p99_ms": 1386.92,
+    "max_ms": 1672.76,
+    "sample_size": 3000
+  },
+  "replication_latency": {
+    "mean_ms": 118.93,
+    "p50_ms": 103.52,
+    "p95_ms": 194.0,
+    "p99_ms": 831.76,
+    "max_ms": 1340.76,
+    "sample_size": 3000
+  },
+  "instantaneous_book_lag_ms": 2727,
+  "candles_m2": {
+    "total_closed": 79,
+    "distinct_open": 79,
+    "gaps_count": 0,
+    "gaps_details": [],
+    "first_candle_brt": "09:00:00",
+    "last_candle_brt": "11:38:00",
+    "minutes_covered": 158
+  }
+}

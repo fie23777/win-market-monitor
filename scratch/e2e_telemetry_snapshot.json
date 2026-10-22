@@ -1,0 +1,126 @@
+{
+  "report_time_brt": "2026-10-19 15:26:37",
+  "watermark_msc": 1792423590001,
+  "watermark_brt": "15:26:30.001",
+  "pid": 3016,
+  "pid_active": true,
+  "cpu_percent": 0.0,
+  "ram_rss_mb": 64.81,
+  "counts": {
+    "reconciled_under_watermark": {
+      "sqlite_ticks": 1750556,
+      "postgres_ticks": 1750556,
+      "discrepancy": 0,
+      "postgres_historical": 759845,
+      "postgres_realtime": 990711,
+      "sum_check_match": true
+    },
+    "recent_unreconciled_activity": {
+      "sqlite_total_buffered": 1750556,
+      "sqlite_pending_replication": 0,
+      "sqlite_committed_local": 1750556,
+      "ticks_buffered_beyond_watermark": 0
+    }
+  },
+  "latencies": {
+    "end_to_end_individual": {
+      "mean_ms": 4769.84,
+      "p50_ms": 4541.65,
+      "p95_ms": 11179.54,
+      "p99_ms": 12727.52,
+      "max_ms": 13391.8,
+      "count": 5000
+    },
+    "capture_individual": {
+      "mean_ms": 4759.58,
+      "p50_ms": 4532.24,
+      "p95_ms": 11170.25,
+      "p99_ms": 12710.22,
+      "max_ms": 13380.64,
+      "count": 5000
+    },
+    "replication_individual": {
+      "mean_ms": 10.27,
+      "p50_ms": 10.17,
+      "p95_ms": 20.36,
+      "p99_ms": 21.36,
+      "max_ms": 22.36,
+      "count": 5000
+    }
+  },
+  "volume_latency_correlation": {
+    "pearson_correlation_tps_vs_latency": 0.0348,
+    "total_seconds_analyzed": 895,
+    "max_tps_observed": 266,
+    "high_load_events_sample": [
+      {
+        "time_brt": "15:11:36",
+        "tps": 6,
+        "avg_e2e_ms": 18769.61,
+        "max_e2e_ms": 18820.94
+      },
+      {
+        "time_brt": "15:11:37",
+        "tps": 59,
+        "avg_e2e_ms": 18166.21,
+        "max_e2e_ms": 18694.94
+      },
+      {
+        "time_brt": "15:11:38",
+        "tps": 74,
+        "avg_e2e_ms": 17159.98,
+        "max_e2e_ms": 17693.94
+      },
+      {
+        "time_brt": "15:11:39",
+        "tps": 77,
+        "avg_e2e_ms": 16212.81,
+        "max_e2e_ms": 16683.94
+      },
+      {
+        "time_brt": "15:11:40",
+        "tps": 54,
+        "avg_e2e_ms": 15272.65,
+        "max_e2e_ms": 15696.94
+      },
+      {
+        "time_brt": "15:11:41",
+        "tps": 69,
+        "avg_e2e_ms": 14389.58,
+        "max_e2e_ms": 14703.05
+      },
+      {
+        "time_brt": "15:11:42",
+        "tps": 53,
+        "avg_e2e_ms": 13546.42,
+        "max_e2e_ms": 14032.34
+      },
+      {
+        "time_brt": "15:11:43",
+        "tps": 61,
+        "avg_e2e_ms": 12485.77,
+        "max_e2e_ms": 13017.35
+      },
+      {
+        "time_brt": "15:11:44",
+        "tps": 67,
+        "avg_e2e_ms": 11545.34,
+        "max_e2e_ms": 12036.25
+      },
+      {
+        "time_brt": "15:11:45",
+        "tps": 73,
+        "avg_e2e_ms": 10523.79,
+        "max_e2e_ms": 11012.62
+      }
+    ]
+  },
+  "candles_m2": {
+    "total_closed": 192,
+    "distinct_open": 192,
+    "gaps_count": 0,
+    "first_candle_brt": "09:00:00",
+    "last_candle_brt": "15:24:00",
+    "minutes_covered": 384
+  }
+}
