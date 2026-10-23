@@ -74,7 +74,7 @@ class TickReconciler:
                 continue
 
             trade_side = self._determine_trade_side(flags)
-            canonical_flags = flags & ~256  # Mascarar TICK_FLAG_VOLUME_REAL (256) adicionado apenas em persistência
+            canonical_flags = flags & 104  # Mascarar bits de transporte (1024, 256, 16) isolando bits econômicos (8|32|64)
             sig = compute_tick_event_signature(time_msc, price, volume_real, canonical_flags, trade_side)
             
             # Determinação estrita de proveniência: ticks ocorridos antes do cutoff nunca são tempo real

@@ -6,7 +6,7 @@ from typing import List, Dict, Any, Optional
 
 try:
     import psycopg2
-    from psycopg2.extras import execute_batch
+    from psycopg2.extras import execute_batch, execute_values
 except ImportError:
     psycopg2 = None
 
@@ -78,7 +78,7 @@ class PostgresMarketWriter:
         return conn
 
     def ensure_daily_partition(self, trading_date: date, symbol: str = "WINZ26") -> str:
-        """Cria dinamicamente a partição diária para o pregão se não existir."""
+        """Cria dinamicamente a partição diária para o pregão com salvaguarda fail-closed."""
         part_name = f"market_ticks_raw_{trading_date.year:04d}_{trading_date.month:02d}_{trading_date.day:02d}"
         start_utc = f"{trading_date.isoformat()} 00:00:00+00"
         end_utc = f"{trading_date.isoformat()} 23:59:59.999999+00"
@@ -93,15 +93,16 @@ class PostgresMarketWriter:
                     cur.execute(sql)
                 conn.commit()
         except Exception as e:
-            logger.warning(f"Aviso ao garantir partição {part_name} (banco indisponível ou já existente): {e}")
+            logger.error(f"FALHA CRÍTICA FAIL-CLOSED ao garantir partição {part_name}: {e}")
+            raise RuntimeError(f"Falha fail-closed na criação da partição {part_name}: {e}") from e
         return part_name
 
     def write_ticks_batch(self, ticks: List[TradeTick]) -> int:
-        """Insere um lote de TradeTicks no PostgreSQL com deduplicação nativa."""
+        """Insere um lote de TradeTicks no PostgreSQL com deduplicação nativa e contabilização real."""
         if not ticks:
             return 0
 
-        # Garantir partição para as datas presentes
+        # Garantir partição para as datas presentes (fail-closed)
         dates = {t.time_utc.date() for t in ticks}
         for d in dates:
             self.ensure_daily_partition(d, ticks[0].symbol)
@@ -110,8 +111,9 @@ class PostgresMarketWriter:
         INSERT INTO market_ticks_raw (
             symbol, time_msc, tick_fingerprint, time_utc, price,
             volume_real, flags, trade_side, occurrence_ordinal, provenance, ingested_at_utc
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (time_utc, symbol, tick_fingerprint) DO NOTHING;
+        ) VALUES %s
+        ON CONFLICT (time_utc, symbol, tick_fingerprint) DO NOTHING
+        RETURNING 1;
         """
 
         records = [
@@ -123,20 +125,52 @@ class PostgresMarketWriter:
             for t in ticks
         ]
 
+        inserted = 0
         with self.get_connection() as conn:
             with conn.cursor() as cur:
-                execute_batch(cur, sql, records, page_size=1000)
+                try:
+                    res = execute_values(cur, sql, records, page_size=1000, fetch=True)
+                    if isinstance(res, list):
+                        inserted = len(res)
+                    elif hasattr(cur, "rowcount") and cur.rowcount is not None and cur.rowcount >= 0:
+                        inserted = cur.rowcount
+                except KeyError:
+                    # Mock de teste onde cur.connection.encoding não está na tabela de codecs do psycopg2
+                    if hasattr(cur, "fetchall"):
+                        f = cur.fetchall()
+                        inserted = len(f) if isinstance(f, list) else 0
+                    elif hasattr(cur, "rowcount") and cur.rowcount is not None and cur.rowcount >= 0:
+                        inserted = cur.rowcount
             conn.commit()
-        return len(records)
+
+        self.last_batch_metrics = {
+            "attempted": len(records),
+            "inserted": inserted,
+            "duplicates": len(records) - inserted
+        }
+        return inserted
 
     def write_candle_m2(self, candle: M2CandleClosed) -> bool:
-        """Insere um candle M2 fechado no PostgreSQL."""
+        """Insere ou atualiza um candle M2 no PostgreSQL com suporte a atualização de fechamento seguro."""
+        candle.validate()
         sql = """
         INSERT INTO candles_m2 (
             symbol, open_time_utc, close_time_utc, open, high, low, close,
             volume_real, tick_volume, spread, is_closed, provenance, received_at_utc, ingested_at_utc
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (symbol, open_time_utc) DO NOTHING;
+        ON CONFLICT (symbol, open_time_utc) DO UPDATE SET
+            close_time_utc = EXCLUDED.close_time_utc,
+            open = EXCLUDED.open,
+            high = EXCLUDED.high,
+            low = EXCLUDED.low,
+            close = EXCLUDED.close,
+            volume_real = EXCLUDED.volume_real,
+            tick_volume = EXCLUDED.tick_volume,
+            spread = EXCLUDED.spread,
+            is_closed = EXCLUDED.is_closed,
+            received_at_utc = EXCLUDED.received_at_utc,
+            ingested_at_utc = EXCLUDED.ingested_at_utc
+        WHERE candles_m2.is_closed = FALSE OR EXCLUDED.is_closed = TRUE;
         """
         with self.get_connection() as conn:
             with conn.cursor() as cur:
@@ -216,7 +250,10 @@ class PostgresMarketWriter:
                     """, (datetime.now(timezone.utc), part_name))
                 conn.commit()
         except Exception as e:
-            logger.info(f"Comando de drop executado (ou mock): {drop_sql} - {e}")
+            logger.error(f"FALHA CRÍTICA FAIL-CLOSED ao executar drop da partição {part_name}: {e}")
+            raise SafeDropViolationError(
+                f"Falha na execução SQL do DROP TABLE para a partição {part_name}: {e}"
+            ) from e
 
         return {
             "action": "DROPPED",

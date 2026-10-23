@@ -285,31 +285,48 @@ class MarketCollectorEngine:
         if not rates:
             return 0
 
+        ckp = self.spool.get_checkpoints(self.symbol)
         synced = 0
         now_server_sec = now_server_msc // 1000
+
         for r in rates:
             candle_sec = int(r["time"])
-            # Considerar fechado se o tempo de encerramento (candle_sec + 120s) for <= now_server_sec
-            if candle_sec + 120 <= now_server_sec:
-                open_utc = self.time_normalizer.server_seconds_to_utc_datetime(candle_sec)
-                close_utc = open_utc + timedelta(minutes=2)
-                candle = M2CandleClosed(
-                    symbol=self.symbol,
-                    open_time_utc=open_utc,
-                    close_time_utc=close_utc,
-                    open=r["open"],
-                    high=r["high"],
-                    low=r["low"],
-                    close=r["close"],
-                    volume_real=r["real_volume"],
-                    tick_volume=r["tick_volume"],
-                    spread=r["spread"],
-                    is_closed=True,
-                    provenance="RECOVERED_HISTORICAL_MT5"
-                )
-                self.spool.append_candle_m2(candle)
-                self.writer.write_candle_m2(candle)
-                synced += 1
+            candle_close_msc = (candle_sec + 120) * 1000
+
+            # Condição 1: passagem temporal do relógio de mercado
+            is_time_elapsed = (candle_sec + 120 <= now_server_sec)
+            if not is_time_elapsed:
+                continue
+
+            # Condição 2 (H002-P1-06): comprovação de cobertura de ticks
+            # O candle só pode ser rotulado como is_closed=True se a janela de ticks correspondente
+            # tiver sido comprovadamente capturada (W_durable) ou auditada (W_complete)
+            is_tick_covered = (
+                (ckp.watermark_complete_msc >= candle_close_msc) or
+                (ckp.last_captured_msc >= candle_close_msc)
+            )
+
+            open_utc = self.time_normalizer.server_seconds_to_utc_datetime(candle_sec)
+            close_utc = open_utc + timedelta(minutes=2)
+            
+            candle = M2CandleClosed(
+                symbol=self.symbol,
+                open_time_utc=open_utc,
+                close_time_utc=close_utc,
+                open=r["open"],
+                high=r["high"],
+                low=r["low"],
+                close=r["close"],
+                volume_real=r["real_volume"],
+                tick_volume=r["tick_volume"],
+                spread=r["spread"],
+                is_closed=is_tick_covered,
+                provenance="RECOVERED_HISTORICAL_MT5" if is_tick_covered else "PROVISIONAL_AWAITING_TICK_COVERAGE"
+            )
+            self.spool.append_candle_m2(candle)
+            self.writer.write_candle_m2(candle)
+            synced += 1
+
         return synced
 
     def maybe_sync_m2_candles(self, last_sync_timestamp: float, interval_sec: float = 60.0) -> tuple[float, int]:

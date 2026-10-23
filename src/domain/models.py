@@ -3,6 +3,11 @@ from datetime import datetime, timezone
 import hashlib
 from typing import Optional
 
+# Máscara canônica de flags econômicas puras de negócio B3/MT5:
+# TICK_FLAG_LAST (8) | TICK_FLAG_BUY (32) | TICK_FLAG_SELL (64) = 104
+# Filtra bits de transporte e metadados voláteis (ex: 1024, 256, 16)
+ECONOMIC_FLAGS_MASK: int = 104
+
 def compute_tick_event_signature(
     time_msc: int,
     price: float,
@@ -10,8 +15,9 @@ def compute_tick_event_signature(
     flags: int,
     trade_side: str
 ) -> str:
-    """Calcula a assinatura de evento independente do lote ou ordem de chegada."""
-    payload = f"{time_msc}_{price:.2f}_{volume_real:.4f}_{flags}_{trade_side}"
+    """Calcula a assinatura de evento independente de bits de transporte ou lote."""
+    canonical_flags = flags & ECONOMIC_FLAGS_MASK
+    payload = f"{time_msc}_{price:.2f}_{volume_real:.4f}_{canonical_flags}_{trade_side}"
     return hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]
 
 def compute_tick_fingerprint(
