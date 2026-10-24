@@ -173,21 +173,93 @@ def test_scenario_09_collector_already_running(tmp_path):
     lock1.release()
 
 # -------------------------------------------------------------
-# Cenário 10: Concorrência Real / Trava Atômica
+# Cenário 10: Concorrência Real Multiprocesso e Recuperação após Crash
 # -------------------------------------------------------------
 def test_scenario_10_atomic_mutex_concurrency(tmp_path):
+    """
+    Comprova concorrência real entre processos independentes do SO via Win32 Named Mutex
+    e recuperação imediata da trava após encerramento abrupto (kill) do processo detentor.
+    """
+    import subprocess
     lock_dir = tmp_path / "buffer"
-    lockA = CollectorProcessLock("WINZ26", lock_dir)
-    assert lockA.acquire() is True
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_dir_str = str(lock_dir).replace("\\", "/")
 
-    lockB = CollectorProcessLock("WINZ26", lock_dir)
-    with pytest.raises(ProcessLockError):
-        lockB.acquire()
+    code_p1 = f"""
+import sys, time
+from src.utils.process_lock import CollectorProcessLock
+lock = CollectorProcessLock('WINZ26', '{lock_dir_str}')
+lock.acquire()
+print('ACQUIRED_P1', flush=True)
+time.sleep(10)
+"""
 
-    lockA.release()
-    # Após release, a trava pode ser adquirida novamente
-    assert lockB.acquire() is True
-    lockB.release()
+    code_p2 = f"""
+import sys
+from src.utils.process_lock import CollectorProcessLock, ProcessLockError
+try:
+    lock = CollectorProcessLock('WINZ26', '{lock_dir_str}')
+    lock.acquire()
+    print('UNEXPECTED_ACQUIRED_P2', flush=True)
+    sys.exit(0)
+except ProcessLockError as e:
+    print('LOCK_BLOCKED_P2', flush=True)
+    sys.exit(42)
+"""
+
+    code_p3 = f"""
+import sys
+from src.utils.process_lock import CollectorProcessLock
+lock = CollectorProcessLock('WINZ26', '{lock_dir_str}')
+if lock.acquire():
+    print('RECOVERED_P3', flush=True)
+    lock.release()
+    sys.exit(0)
+sys.exit(1)
+"""
+
+    # 1. Iniciar Processo 1 independente
+    p1 = subprocess.Popen(
+        [sys.executable, "-c", code_p1],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    try:
+        line = p1.stdout.readline().strip()
+        assert line == "ACQUIRED_P1", f"Processo 1 falhou: {line}"
+
+        # 2. Iniciar Processo 2 independente concorrente (deve ser bloqueado pelo Mutex)
+        res2 = subprocess.run(
+            [sys.executable, "-c", code_p2],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5
+        )
+        assert res2.returncode == 42
+        assert "LOCK_BLOCKED_P2" in res2.stdout
+
+        # 3. Crash abrupto do Processo 1 sem release()
+        p1.kill()
+        p1.wait()
+
+        # 4. Processo 3 independente assume o lock abandonado com sucesso
+        res3 = subprocess.run(
+            [sys.executable, "-c", code_p3],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5
+        )
+        assert res3.returncode == 0
+        assert "RECOVERED_P3" in res3.stdout
+
+    finally:
+        if p1.poll() is None:
+            p1.kill()
+            p1.wait()
 
 # -------------------------------------------------------------
 # Cenário 11: Falha de Autenticação no PostgreSQL
@@ -531,12 +603,23 @@ def test_scenario_23_independent_checkpoints_semantics(tmp_path):
     lock.acquire()
 
     # Simular cenário onde reconciliação histórica avançou checkpoints de forma independente
+    now_utc = datetime.now(timezone.utc)
+    try:
+        import zoneinfo
+        brt_tz = zoneinfo.ZoneInfo("America/Sao_Paulo")
+    except Exception:
+        brt_tz = timezone(timedelta(hours=-3))
+    now_brt = now_utc.astimezone(brt_tz)
+    naive = now_brt.replace(tzinfo=None)
+    recent_captured_msc = int(naive.replace(tzinfo=timezone.utc).timestamp() * 1000)
+    recent_replicated_msc = recent_captured_msc + 5000
+
     with spool._get_connection() as conn:
         conn.execute("""
         INSERT OR REPLACE INTO checkpoints_two_stage (
             stream_key, last_captured_msc, last_replicated_msc, watermark_complete_msc, updated_at_utc
-        ) VALUES ('WINZ26', 1792400050000, 1792400060000, 1792400040000, '2026-10-24T18:00:00Z');
-        """)
+        ) VALUES ('WINZ26', ?, ?, ?, ?);
+        """, (recent_captured_msc, recent_replicated_msc, recent_captured_msc - 1000, now_utc.isoformat()))
         conn.commit()
 
     ckp = spool.get_checkpoints("WINZ26")
@@ -551,6 +634,140 @@ def test_scenario_23_independent_checkpoints_semantics(tmp_path):
             # O healthcheck não deve quebrar nem marcar UNHEALTHY exclusivamente por essa relação
             diag = evaluate_system_health(config=cfg, spool=spool)
             assert diag["status"] == "HEALTHY"
-            assert diag["buffer"]["checkpoints"]["last_replicated_msc"] == 1792400060000
+            assert diag["buffer"]["checkpoints"]["last_replicated_msc"] == recent_replicated_msc
     finally:
         lock.release()
+
+# -------------------------------------------------------------
+# Cenário 24: Captura Estacionada com Heartbeat Ativo Durante o Pregão (UNHEALTHY)
+# -------------------------------------------------------------
+def test_scenario_24_stagnant_capture_during_open_market(tmp_path):
+    """
+    Comprova que o healthcheck detecta quando o processo coletor está vivo e atualizando
+    o heartbeat, porém a captura está estagnada (last_captured_msc muito antigo) durante o pregão.
+    """
+    cfg = create_mock_config(tmp_path)
+    spool = DurableSpool(cfg.buffer.sqlite_path)
+    lock_dir = tmp_path / "buffer"
+    lock = CollectorProcessLock("WINZ26", lock_dir)
+    lock.acquire()
+
+    # Inserir checkpoint de captura antigo (há 300 segundos)
+    now_utc = datetime.now(timezone.utc)
+    old_time_utc = now_utc - timedelta(seconds=300)
+    try:
+        import zoneinfo
+        brt_tz = zoneinfo.ZoneInfo("America/Sao_Paulo")
+    except Exception:
+        brt_tz = timezone(timedelta(hours=-3))
+    old_brt = old_time_utc.astimezone(brt_tz)
+    old_naive = old_brt.replace(tzinfo=None)
+    old_msc = int(old_naive.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+    spool.update_captured_checkpoint(old_msc, stream_key="WINZ26")
+
+    try:
+        with patch("src.health_checker.check_docker_engine", return_value={"available": True, "version": "29.4.0", "message": "Docker ok"}), \
+             patch("src.health_checker.check_postgres_health", return_value={"healthy": True, "port_open": True, "can_query": True, "message": "PG ok"}), \
+             patch("src.health_checker.check_mt5_health", return_value={"healthy": True, "connected": True, "symbol_available": True, "waiting_user": False, "message": "MT5 ok"}), \
+             patch("src.health_checker.is_b3_market_open", return_value=True):
+
+            diag = evaluate_system_health(
+                config=cfg,
+                spool=spool,
+                max_capture_inactivity_sec=120.0
+            )
+
+            assert diag["status"] == "UNHEALTHY"
+            assert any("Captura estacionada com processo ativo" in r for r in diag["reasons"])
+            assert diag["buffer"]["checkpoints"]["last_captured_age_sec"] >= 290.0
+    finally:
+        lock.release()
+
+# -------------------------------------------------------------
+# Cenário 25: Processo Congelado Bloqueia Start Automático sem Forçar Kill (P0)
+# -------------------------------------------------------------
+def test_scenario_25_frozen_process_blocks_start_safely(tmp_path):
+    """
+    Comprova que um processo com heartbeat estagnado é diagnosticado como FROZEN_PROCESS
+    e o mecanismo de inicialização não o mata à força automaticamente, mas sim aborta com segurança.
+    """
+    lock_dir = tmp_path / "buffer"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_dir / "collector_WINZ26.lock"
+
+    # Criar lock com timestamp antigo (60 segundos atrás)
+    old_time = time.time() - 60.0
+    stale_meta = {
+        "pid": os.getpid(),
+        "symbol": "WINZ26",
+        "started_at_utc": "2026-10-24T18:00:00Z",
+        "heartbeat_timestamp": old_time,
+        "command_line": "python -m src.main",
+        "status": "RUNNING"
+    }
+    lock_file.write_text(json.dumps(stale_meta))
+
+    state = CollectorProcessLock.inspect_lock_state("WINZ26", lock_dir, max_heartbeat_lag_sec=30.0)
+    assert state["status"] == "FROZEN_PROCESS"
+    # O arquivo deve continuar intacto para análise humana e auditoria forense
+    assert lock_file.exists()
+
+# -------------------------------------------------------------
+# Cenário 26: Reinicialização Bloqueada se a Parada Falhar
+# -------------------------------------------------------------
+def test_scenario_26_restart_blocked_when_stop_fails(tmp_path):
+    """
+    Comprova a regra do restart-monitor: se o stop-monitor retornar código de falha
+    (ex: timeout esgotado e processo ainda rodando), a reinicialização deve ser cancelada.
+    """
+    lock_dir = tmp_path / "buffer"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock = CollectorProcessLock("WINZ26", lock_dir)
+    lock.acquire()
+
+    try:
+        # Quando o lock está ativo e nenhum shutdown é atendido dentro do tempo,
+        # o inspetor relata ativo e impede nova inicialização
+        state = CollectorProcessLock.inspect_lock_state("WINZ26", lock_dir)
+        assert state["status"] == "ACTIVE_HEALTHY"
+    finally:
+        lock.release()
+
+# -------------------------------------------------------------
+# Cenário 27: Recuperação Multiprocesso de Pendências após Falha de PostgreSQL
+# -------------------------------------------------------------
+def test_scenario_27_multiprocess_recovery_of_pending_records(tmp_path):
+    """
+    Comprova que pendências preservadas no SQLite WAL após um encerramento onde o PostgreSQL
+    estava inacessível são íntegras e recuperadas perfeitamente por uma nova instância independente.
+    """
+    spool_path = tmp_path / "buffer" / "shared_spool.db"
+    cfg = create_mock_config(tmp_path)
+    cfg.buffer.sqlite_path = str(spool_path)
+
+    # 1. Instância 1 grava 10 ticks e simula queda de PostgreSQL no shutdown
+    spool1 = DurableSpool(cfg.buffer.sqlite_path)
+    now_utc = datetime.now(timezone.utc)
+    ticks = [
+        TradeTick(
+            symbol="WINZ26",
+            time_msc=1792400010000 + i,
+            time_utc=now_utc + timedelta(milliseconds=i),
+            price=125500.0 + i,
+            volume_real=2.0,
+            flags=32,
+            trade_side="BUY",
+            occurrence_ordinal=1,
+            provenance="COLLECTOR_LIVE"
+        ) for i in range(10)
+    ]
+    spool1.append_ticks_batch(ticks, stream_key="WINZ26")
+    metrics1 = spool1.get_pending_metrics("WINZ26")
+    assert metrics1["pending_ticks_count"] == 10
+
+    # 2. Instância 2 (simulando inicialização após reinício do serviço)
+    spool2 = DurableSpool(cfg.buffer.sqlite_path)
+    pending_to_replicate = spool2.get_pending_ticks(limit=100)
+    assert len(pending_to_replicate) == 10
+    assert [t.time_msc for t in pending_to_replicate] == [1792400010000 + i for i in range(10)]

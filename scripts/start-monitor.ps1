@@ -253,10 +253,11 @@ if ($LockDiag) {
         Write-Host " [INFO] Nenhuma instancia duplicada foi criada (idempotencia preservada)." -ForegroundColor Cyan
         $NeedStartCollector = $false
     } elseif ($LockDiag.status -eq "FROZEN_PROCESS") {
-        Write-Host " [FALHA CRITICA] Processo coletor (PID $($LockDiag.pid)) esta congelado (heartbeat estagnado)." -ForegroundColor Red
-        Write-Host " Diagnostico: Encerrando processo congelado antes de reiniciar..." -ForegroundColor Yellow
-        Stop-Process -Id $LockDiag.pid -Force -ErrorAction SilentlyContinue
-        $NeedStartCollector = $true
+        Write-Host (" [FALHA CRITICA] Processo coletor (PID " + $LockDiag.pid + ") esta com heartbeat estagnado (" + $LockDiag.heartbeat_age_sec + "s).") -ForegroundColor Red
+        Write-Host " Diagnostico: O processo pode estar bloqueado em operacao do MT5/SQLite ou travado." -ForegroundColor Yellow
+        Write-Host " Seguranca: Encerramento automatico forcado bloqueado para evitar perda de estado ou mascaramento de causa raiz." -ForegroundColor Yellow
+        Write-Host " Instrucao: Investigue o processo ou execute stop-monitor.bat deliberadamente antes de reiniciar." -ForegroundColor Yellow
+        exit 1
     } elseif ($LockDiag.status -in @("STALE_LOCK", "REUSED_PID", "CORRUPTED_LOCK")) {
         Write-Host " [INFO] Limpando trava orfa ou PID reaproveitado ($($LockDiag.status))..." -ForegroundColor Yellow
         $LockFile = Join-Path $ProjectRoot "data\buffer\collector_$Symbol.lock"
@@ -269,7 +270,7 @@ if ($NeedStartCollector) {
     $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
     $CollectorLogFile = Join-Path $LogDir "collector_$Timestamp.log"
 
-    Write-Host " [INFO] Inicializando coletor em background ($PythonExe -m src.main)..." -ForegroundColor White
+    Write-Host (" [INFO] Inicializando coletor em background: " + $PythonExe + " -m src.main") -ForegroundColor White
     Write-Host " [INFO] Logs da execucao: $CollectorLogFile" -ForegroundColor Gray
 
     $ProcInfo = New-Object System.Diagnostics.ProcessStartInfo

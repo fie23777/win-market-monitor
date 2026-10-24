@@ -173,6 +173,7 @@ def evaluate_system_health(
     max_pending_count: int = 5000,
     max_pending_age_sec: float = 60.0,
     max_heartbeat_lag_sec: float = 30.0,
+    max_capture_inactivity_sec: float = 120.0,
     reader: Optional[MT5ReadOnlyReader] = None,
     spool: Optional[DurableSpool] = None
 ) -> Dict[str, Any]:
@@ -225,6 +226,12 @@ def evaluate_system_health(
         oldest_pending_utc = sp.time_normalizer.server_msc_to_utc_datetime(oldest_pending_msc)
         pending_age_sec = max(0.0, (now_utc - oldest_pending_utc).total_seconds())
 
+    # Análise de inatividade da captura
+    capture_age_sec = 0.0
+    if ckp.last_captured_msc > 0:
+        last_captured_utc = sp.time_normalizer.server_msc_to_utc_datetime(ckp.last_captured_msc)
+        capture_age_sec = max(0.0, (now_utc - last_captured_utc).total_seconds())
+
     # Determinação do Status Global
     status = "HEALTHY"
     reasons = []
@@ -241,6 +248,15 @@ def evaluate_system_health(
     if lock_diag["status"] in ("CORRUPTED_LOCK", "REUSED_PID"):
         status = "UNHEALTHY"
         reasons.append(lock_diag["message"])
+
+    # Detecção explícita de captura estacionada com processo ativo durante o pregão
+    if market_open and lock_diag["status"] == "ACTIVE_HEALTHY" and mt5_diag.get("healthy"):
+        if ckp.last_captured_msc > 0 and capture_age_sec > max_capture_inactivity_sec:
+            status = "UNHEALTHY"
+            reasons.append(
+                f"Captura estacionada com processo ativo: nenhum novo evento capturado há {capture_age_sec:.1f}s "
+                f"durante o pregão da B3 (tolerância: {max_capture_inactivity_sec:.1f}s)."
+            )
 
     if ckp.last_captured_msc < 0 or ckp.last_replicated_msc < 0:
         status = "UNHEALTHY"
@@ -319,6 +335,7 @@ def evaluate_system_health(
         "buffer": {
             "checkpoints": {
                 "last_captured_msc": ckp.last_captured_msc,
+                "last_captured_age_sec": round(capture_age_sec, 2),
                 "last_replicated_msc": ckp.last_replicated_msc,
                 "watermark_complete_msc": getattr(ckp, "watermark_complete_msc", 0)
             },

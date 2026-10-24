@@ -24,9 +24,17 @@ Write-Host "=================================================" -ForegroundColor 
 # 1. Parada Segura
 $StopScript = Join-Path $ScriptDir "stop-monitor.ps1"
 & $StopScript -ConfigPath $ConfigPath
+$StopExitCode = $LASTEXITCODE
+
+if ($StopExitCode -ne 0) {
+    Write-Host "[ERRO] A parada segura do coletor falhou ou nao foi concluida (codigo: $StopExitCode)." -ForegroundColor Red
+    Write-Host "[ABORTADO] Reinicializacao cancelada para evitar processos zumbis ou corrupcao de estado." -ForegroundColor Yellow
+    exit $StopExitCode
+}
+
 Start-Sleep -Seconds 2
 
-# 2. Inicialização Automatizada
+# 2. Inicializacao Automatizada
 $StartScript = Join-Path $ScriptDir "start-monitor.ps1"
 & $StartScript -ConfigPath $ConfigPath
 $ExitCode = $LASTEXITCODE
