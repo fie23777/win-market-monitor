@@ -3,7 +3,8 @@ import json
 from pathlib import Path
 from datetime import datetime, timezone
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any
+from contextlib import contextmanager
+from typing import List, Optional, Dict, Any, Generator
 from src.domain.models import TradeTick, M2CandleClosed, Checkpoints
 from src.connection.mt5_time_normalizer import MT5TimeNormalizer
 
@@ -13,6 +14,29 @@ class BatchInsertionResult:
     inserted_count: int
     duplicate_count: int
     failed_count: int = 0
+
+class ManagedSqliteConnection:
+    """
+    Proxy de conexão SQLite que delega chamadas diretas (ex: conn.execute) e
+    assegura fechamento explícito do handle de arquivo ao ser utilizado como context manager.
+    """
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+
+    def __enter__(self) -> sqlite3.Connection:
+        return self._conn.__enter__()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            return self._conn.__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
 
 class DurableSpool:
     """
@@ -28,12 +52,12 @@ class DurableSpool:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    def _get_connection(self) -> sqlite3.Connection:
+    def _get_connection(self) -> ManagedSqliteConnection:
         conn = sqlite3.connect(str(self.db_path), timeout=30.0)
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA synchronous = FULL;")
         conn.row_factory = sqlite3.Row
-        return conn
+        return ManagedSqliteConnection(conn)
 
     def _init_db(self):
         with self._get_connection() as conn:
@@ -471,6 +495,38 @@ class DurableSpool:
             LIMIT ?;
             """, (stream_key, limit))
             return [dict(r) for r in cursor.fetchall()]
+
+    def get_pending_metrics(self, symbol: str = "WINZ26") -> Dict[str, Any]:
+        """
+        Retorna estatísticas detalhadas de pendências de replicação no buffer local.
+        Permite ao healthcheck diferenciar acúmulo normal de lotes de backpressure crítico.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            SELECT 
+                COUNT(1) AS pending_ticks_count,
+                MIN(time_msc) AS oldest_pending_msc,
+                MAX(time_msc) AS newest_pending_msc
+            FROM spool_ticks
+            WHERE symbol = ? AND status = 'PENDING';
+            """, (symbol,))
+            row_ticks = cursor.fetchone()
+
+            cursor.execute("""
+            SELECT COUNT(1) AS pending_candles_count
+            FROM spool_candles_m2
+            WHERE symbol = ? AND status = 'PENDING';
+            """, (symbol,))
+            row_candles = cursor.fetchone()
+
+        return {
+            "symbol": symbol,
+            "pending_ticks_count": row_ticks["pending_ticks_count"] if row_ticks else 0,
+            "oldest_pending_msc": row_ticks["oldest_pending_msc"] if row_ticks else None,
+            "newest_pending_msc": row_ticks["newest_pending_msc"] if row_ticks else None,
+            "pending_candles_count": row_candles["pending_candles_count"] if row_candles else 0
+        }
 
 
 

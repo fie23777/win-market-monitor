@@ -1,0 +1,17 @@
+{
+  "symbol": "WINZ26",
+  "docker_desktop_path": "C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe",
+  "mt5_terminal_path": "C:\\Program Files\\MetaTrader 5 Terminal\\terminal64.exe",
+  "compose_file": "docker/docker-compose.yml",
+  "docker_timeout_sec": 120,
+  "docker_retry_interval_sec": 3,
+  "postgres_timeout_sec": 45,
+  "postgres_retry_interval_sec": 2,
+  "mt5_timeout_sec": 60,
+  "graceful_stop_timeout_sec": 25,
+  "health_pending_count_threshold": 5000,
+  "health_pending_age_sec_threshold": 60,
+  "health_heartbeat_timeout_sec": 30,
+  "log_dir": "data/logs",
+  "python_executable": "python"
+}
